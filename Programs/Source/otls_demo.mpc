@@ -1,0 +1,37 @@
+"""
+OTLS MPC demo: receive shared-secret bytes from an ExternalIO client,
+hold them in secret-shared form across all parties, then reveal back.
+
+Protocol: replicated ring (3 parties, semi-honest, mod 2^k).
+The client sends 4 x 64-bit integers (= 32 bytes of TLS shared secret).
+"""
+
+PORTNUM = 18000
+N_CHUNKS = 4
+
+listen_for_clients(PORTNUM)
+print_ln('otls_demo: waiting for client on port %s ...', PORTNUM)
+
+client_socket = accept_client_connection(PORTNUM)
+print_ln('otls_demo: client connected (socket=%s)', client_socket)
+
+# Finish flag (1 = last/only client)
+_ = regint.read_from_socket(client_socket)
+
+# Receive 4 secret integers from the client.
+# Each party only holds a share; no single party sees the values.
+chunks = sint.receive_from_client(N_CHUNKS, client_socket)
+
+# --- MPC computation (identity pass-through for now) ---
+# In future milestones this is where HKDF / HMAC / AEAD logic goes.
+result = Array(N_CHUNKS, sint)
+for i in range(N_CHUNKS):
+    result[i] = chunks[i]
+
+# Reveal results back to the client only.
+dest = Array(1, regint)
+dest[0] = client_socket
+sint.reveal_to_clients(dest, [result[i] for i in range(N_CHUNKS)])
+
+closeclientconnection(client_socket)
+print_ln('otls_demo: done')
