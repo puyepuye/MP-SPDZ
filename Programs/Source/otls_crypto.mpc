@@ -8,7 +8,7 @@ from circuit import sha256 as _sha256_raw, Circuit
 aes128_circuit = Circuit('aes_128')
 
 # ============================================================
-# sbitvec helpers
+# sbitvec helpers -- a vector of secret bits
 # ============================================================
 
 def bv_xor(a, b):
