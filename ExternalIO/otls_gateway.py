@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """OTLS Gateway: thin TCP proxy between HTTPS server and MPC parties.
 
-Handles only: X25519 key exchange, TLS record framing, transcript hashing
-(all public/non-secret operations). All key derivation and AEAD crypto
-happens inside the MPC parties.
+Handles: TLS record framing, transcript hashing (public). If OTLS_MPC_X25519=1,
+does not compute the shared secret locally — sends three additive shares of the
+client scalar (12 private words) + server public key for MPC X25519 (otls_demo_field).
+Otherwise derives shared secret in-process for
+the ring demo (otls_demo). Key derivation and AEAD run inside MPC in both cases.
 """
-import sys, os, struct, socket, hashlib, select
+import sys, os, struct, socket, hashlib, select, secrets
+from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'otls'))
 sys.path.insert(0, os.path.dirname(__file__))
@@ -38,8 +41,24 @@ def pack_bytes(data, max_words):
 def unpack_words(values, length):
     result = b''
     for w in values:
+        if w < 0:
+            w += (1 << 64)
         result += (w & ((1 << 64) - 1)).to_bytes(8, 'big')
     return result[:length]
+
+def scalar_int_to_be_words(k):
+    """256-bit scalar as int -> 4 x 64-bit BE words (must match otls_demo_field sint packing)."""
+    b = k.to_bytes(32, 'little')
+    return [int.from_bytes(b[i:i + 8], 'big') for i in range(0, 32, 8)]
+
+def split_scalar_three_shares_mod_2_256(scalar_raw32):
+    """Additive shares r0,r1,r2 with (r0+r1+r2) ≡ k (mod 2^256), k = LE scalar bytes."""
+    mod = 1 << 256
+    k = int.from_bytes(scalar_raw32, 'little')
+    r0 = secrets.randbelow(mod)
+    r1 = secrets.randbelow(mod)
+    r2 = (k - r0 - r1) % mod
+    return r0, r1, r2
 
 def read_tls_record(sock):
     buf = b''
@@ -83,8 +102,14 @@ def gateway_main(host, port, path, mpc_port=18000):
     if cipher_suite != 0x1301:
         raise Exception(f'Server chose cipher 0x{cipher_suite:04x}, but MPC only supports 0x1301 (AES-128-GCM-SHA256)')
 
-    shared_secret = x25519_derive_shared_secret(priv_key, server_pub)
-    log(f'X25519 shared secret computed')
+    # OTLS_MPC_X25519=1: shared secret computed only inside MP-SPDZ (otls_demo_field.mpc).
+    # OTLS_MPC_X25519=0: gateway derives SS and sends it as private input (otls_demo.mpc ring path).
+    mpc_x25519 = os.getenv('OTLS_MPC_X25519', '0') == '1'
+    if mpc_x25519:
+        log('X25519 deferred to MPC (sending 3 scalar shares + server pub)')
+    else:
+        shared_secret = x25519_derive_shared_secret(priv_key, server_pub)
+        log('X25519 shared secret computed (gateway)')
 
     # Read encrypted server handshake records + any NewSessionTickets
     enc_records = []
@@ -114,20 +139,33 @@ def gateway_main(host, port, path, mpc_port=18000):
     mpc = Client(['localhost'] * 3, mpc_port, 0)
     log('Connected to MPC')
 
-    # Send transcript hash (4 x 64-bit words, BE)
+    # Send transcript hash (4 x 64-bit words, BE) — public regint path
     th_words = [int.from_bytes(th_ch_sh[i:i+8], 'big') for i in range(0, 32, 8)]
-    mpc.send_public_inputs(th_words)
+    mpc.send_public_inputs_raw64(th_words)
 
-    # Send shared secret (private, 4 x 64-bit words)
-    ss_words = [int.from_bytes(shared_secret[i:i+8], 'big') for i in range(0, 32, 8)]
-    mpc.send_private_inputs(ss_words)
+    if mpc_x25519:
+        client_scalar_raw = priv_key.private_bytes(
+            Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+        r0, r1, r2 = split_scalar_three_shares_mod_2_256(client_scalar_raw)
+        cs_words = (
+            scalar_int_to_be_words(r0)
+            + scalar_int_to_be_words(r1)
+            + scalar_int_to_be_words(r2))
+        mpc.send_private_inputs(cs_words)
+        sp_words = [int.from_bytes(server_pub[i:i+8], 'big')
+                    for i in range(0, 32, 8)]
+        mpc.send_public_inputs_raw64(sp_words)
+    else:
+        ss_words = [int.from_bytes(shared_secret[i:i+8], 'big')
+                    for i in range(0, 32, 8)]
+        mpc.send_private_inputs(ss_words)
 
     # Send encrypted records
-    mpc.send_public_inputs([len(enc_records)])
+    mpc.send_public_inputs_raw64([len(enc_records)])
     for rec in enc_records:
-        mpc.send_public_inputs([len(rec)] + pack_bytes(rec, MAX_REC_WORDS))
+        mpc.send_public_inputs_raw64([len(rec)] + pack_bytes(rec, MAX_REC_WORDS))
     for _ in range(MAX_HS_RECORDS - len(enc_records)):
-        mpc.send_public_inputs([0] + [0] * MAX_REC_WORDS)
+        mpc.send_public_inputs_raw64([0] + [0] * MAX_REC_WORDS)
 
     # --- Phase 2: Receive ALL decrypted server HS records from MPC ---
     log('Waiting for MPC to decrypt server handshake records...')
@@ -171,8 +209,8 @@ def gateway_main(host, port, path, mpc_port=18000):
 
     # --- Phase 3: Send transcript hash + HTTP request to MPC ---
     th_sf_words = [int.from_bytes(th_sf[i:i+8], 'big') for i in range(0, 32, 8)]
-    mpc.send_public_inputs(th_sf_words)
-    mpc.send_public_inputs([len(req)] + pack_bytes(req, MAX_APP_WORDS))
+    mpc.send_public_inputs_raw64(th_sf_words)
+    mpc.send_public_inputs_raw64([len(req)] + pack_bytes(req, MAX_APP_WORDS))
 
     # --- Phase 4: Receive encrypted records from MPC ---
     log('Waiting for MPC to encrypt Client Finished + HTTP GET...')
@@ -231,12 +269,12 @@ def gateway_main(host, port, path, mpc_port=18000):
             log(f'  WARNING: record {len(rec)} exceeds buffer {MAX_APP_WORDS*8}, truncating')
 
     # Send to MPC: sequence offset, then records
-    mpc.send_public_inputs([srv_app_seq])
-    mpc.send_public_inputs([len(resp_records)])
+    mpc.send_public_inputs_raw64([srv_app_seq])
+    mpc.send_public_inputs_raw64([len(resp_records)])
     for rec in resp_records[:MAX_RESP_RECORDS]:
-        mpc.send_public_inputs([len(rec)] + pack_bytes(rec, MAX_APP_WORDS))
+        mpc.send_public_inputs_raw64([len(rec)] + pack_bytes(rec, MAX_APP_WORDS))
     for _ in range(MAX_RESP_RECORDS - min(len(resp_records), MAX_RESP_RECORDS)):
-        mpc.send_public_inputs([0] + [0] * MAX_APP_WORDS)
+        mpc.send_public_inputs_raw64([0] + [0] * MAX_APP_WORDS)
 
     # --- Phase 6: Receive decrypted response ---
     log('Waiting for MPC to decrypt response...')
