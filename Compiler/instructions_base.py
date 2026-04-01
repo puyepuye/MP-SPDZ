@@ -196,6 +196,7 @@ opcodes = dict(
     CONVINT = 0xC0,
     CONVMODP = 0xC1,
     GCONVGF2N = 0x1C1,
+    OTLS_CONN_ROLE = 0x1C2,
     # IO
     PRINTMEM = 0xB0,
     PRINTREG = 0XB1,

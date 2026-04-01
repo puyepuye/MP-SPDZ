@@ -306,6 +306,7 @@ enum
     // Conversion
     GCONVINT = 0x1C0,
     GCONVGF2N = 0x1C1,
+    OTLS_CONN_ROLE = 0x1C2,
     // IO
     GPRINTMEM = 0x1B0,
     GPRINTREG = 0X1B1,

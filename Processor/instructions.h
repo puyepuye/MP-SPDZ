@@ -280,6 +280,7 @@
             (*source++).output(Proc.get_public_output(), false)) \
 
 #define REMAINING_INSTRUCTIONS \
+    X(OTLS_CONN_ROLE, throw not_implemented(),) \
     X(CONVMODP, throw not_implemented(),) \
     X(LDMC, throw not_implemented(),) \
     X(STMC, throw not_implemented(),) \

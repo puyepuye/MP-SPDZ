@@ -139,6 +139,15 @@ class Client:
         triples = self.receive_triples(T, n)
         return [int(self.clear_domain(triple[0].v)) for triple in triples]
 
+    def send_public_inputs_raw64(self, values):
+        """Send values as raw 64-bit LE integers, bypassing domain encoding.
+        Use this when the MPC side reads with regint.read_from_socket."""
+        os = octetStream()
+        for value in values:
+            os.buf += struct.pack('<Q', int(value) & ((1 << 64) - 1))
+        for socket in self.sockets:
+            os.Send(socket)
+
     def send_public_inputs(self, values):
         """ Send values in the clear. This works for public inputs
         to all servers or to send shares to a single server.

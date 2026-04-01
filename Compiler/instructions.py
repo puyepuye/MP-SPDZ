@@ -607,6 +607,14 @@ class playerid(base.Instruction):
     code = base.opcodes['PLAYERID']
     arg_format = ['ciw']
 
+class otls_conn_role(base.Instruction):
+    """ In-process OTLS hook: C++ receives party id and immediate role tag.
+
+    :param: role (int immediate; convention: 0 hello/sender side, 1 TCP/socket side, …)
+    """
+    code = base.opcodes['OTLS_CONN_ROLE']
+    arg_format = ['i']
+
 ###
 ### Basic arithmetic
 ###

@@ -2,6 +2,7 @@
 #define PROCESSOR_INSTRUCTION_HPP_
 
 #include "Processor/Instruction.h"
+#include "Processor/OtlsConnection.h"
 #include "Processor/Machine.h"
 #include "Processor/Processor.h"
 #include "Processor/IntInput.h"
@@ -279,6 +280,9 @@ void BaseInstruction::parse_operands(istream& s, int pos, int file_pos)
       case START:
       case STOP:
       case PRINTFLOATPREC:
+        n = get_int(s);
+        break;
+      case OTLS_CONN_ROLE:
         n = get_int(s);
         break;
       // instructions with no operand
@@ -606,6 +610,8 @@ int BaseInstruction::get_reg_type() const
     case USE_MATMUL:
     case RUN_TAPE:
       // those use r[] not for registers
+      return NONE;
+    case OTLS_CONN_ROLE:
       return NONE;
     case LDI:
     case LDMC:
@@ -1318,6 +1324,9 @@ inline void Instruction::execute(Processor<sint, sgf2n>& Proc) const
         break;
       case PLAYERID:
         Proc.write_Ci(r[0], Proc.P.my_num());
+        break;
+      case OTLS_CONN_ROLE:
+        OtlsConnection::log_role(Proc.P.my_num(), n);
         break;
       case CMDLINEARG:
         {

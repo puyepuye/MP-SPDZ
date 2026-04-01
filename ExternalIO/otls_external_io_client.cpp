@@ -2,6 +2,9 @@
 #include "Math/Setup.h"
 #include "Math/Z2k.h"
 #include "Math/Z2k.hpp"
+#include "Math/gfp.h"
+#include "Math/gfp.hpp"
+#include "Math/bigint.h"
 #include "Tools/int.h"
 
 #include <openssl/evp.h>
@@ -55,7 +58,7 @@ constexpr uint16_t EXT_KEY_SHARE = 0x0033;
 
 void log(const string& s)
 {
-    cerr << "[gateway-cpp] " << s << "\n";
+    cerr << "[otls-external-io] " << s << "\n";
 }
 
 template<class T>
@@ -455,6 +458,108 @@ void send_public_inputs(Client& client, const vector<long>& values)
         os.Send(socket);
 }
 
+/** Raw 64-bit little-endian words (matches Python Client.send_public_inputs_raw64 + regint.read_from_socket). */
+void send_public_inputs_raw64(Client& client, const vector<long>& values)
+{
+    octetStream os;
+    for (auto v : values)
+    {
+        uint64_t u = (uint64_t) (long long) v;
+        octet le[8];
+        for (int i = 0; i < 8; i++)
+            le[i] = (u >> (8 * i)) & 0xff;
+        os.append(le, 8);
+    }
+    for (auto* socket : client.sockets)
+        os.Send(socket);
+}
+
+void add_mod256(const uint8_t* a, const uint8_t* b, uint8_t* out)
+{
+    uint16_t c = 0;
+    for (int i = 0; i < 32; i++)
+    {
+        c = (uint16_t) c + a[i] + b[i];
+        out[i] = (uint8_t) (c & 0xff);
+        c >>= 8;
+    }
+}
+
+void sub_mod256(const uint8_t* k, const uint8_t* s, uint8_t* out)
+{
+    int borrow = 0;
+    for (int i = 0; i < 32; i++)
+    {
+        int v = (int) k[i] - (int) s[i] - borrow;
+        if (v < 0)
+        {
+            v += 256;
+            borrow = 1;
+        }
+        else
+            borrow = 0;
+        out[i] = (uint8_t) v;
+    }
+}
+
+/** 256-bit integer (LE) -> 4 x 64-bit BE words (matches Python scalar_int_to_be_words). */
+vector<uint64_t> scalar_le_to_be_words(const uint8_t* le32)
+{
+    vector<uint64_t> w(4);
+    for (int i = 0; i < 4; i++)
+    {
+        uint64_t x = 0;
+        for (int j = 0; j < 8; j++)
+            x = (x << 8) | le32[i * 8 + j];
+        w[i] = x;
+    }
+    return w;
+}
+
+/** Three additive shares mod 2^256 -> 12 BE words for otls_demo_field private inputs. */
+vector<uint64_t> split_scalar_three_shares(const uint8_t* priv_le32)
+{
+    uint8_t r0[32], r1[32], r2[32], sum01[32];
+    if (RAND_bytes(r0, 32) != 1 || RAND_bytes(r1, 32) != 1)
+        throw runtime_error("RAND_bytes failed");
+    add_mod256(r0, r1, sum01);
+    sub_mod256(priv_le32, sum01, r2);
+
+    vector<uint64_t> out;
+    auto w0 = scalar_le_to_be_words(r0);
+    auto w1 = scalar_le_to_be_words(r1);
+    auto w2 = scalar_le_to_be_words(r2);
+    out.insert(out.end(), w0.begin(), w0.end());
+    out.insert(out.end(), w1.begin(), w1.end());
+    out.insert(out.end(), w2.begin(), w2.end());
+    return out;
+}
+
+vector<long> digest_to_words32(const vector<uint8_t>& d)
+{
+    auto u = scalar_le_to_be_words(d.data());
+    vector<long> w;
+    for (uint64_t x : u)
+        w.push_back((long) (int64_t) x);
+    return w;
+}
+
+vector<uint8_t> unpack_words_fp(const vector<gfp0>& vals, size_t length)
+{
+    vector<uint8_t> out;
+    out.reserve(vals.size() * 8);
+    for (auto& v : vals)
+    {
+        bigint b = v;
+        uint64_t w = b.get_ui();
+        for (int i = 7; i >= 0; --i)
+            out.push_back((w >> (i * 8)) & 0xff);
+    }
+    if (out.size() > length)
+        out.resize(length);
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -487,9 +592,6 @@ int main(int argc, char** argv)
         if (cipher_suite != TLS_AES_128_GCM_SHA256)
             throw runtime_error("Server selected unsupported cipher");
 
-        auto shared_secret = x25519_derive(kp.priv, server_pub);
-        log("X25519 shared secret computed");
-
         vector<vector<uint8_t>> enc_records;
         while ((int) enc_records.size() < MAX_HS_RECORDS)
         {
@@ -517,36 +619,43 @@ int main(int argc, char** argv)
         vector<string> hosts(3, "localhost");
         Client client(hosts, mpc_port, 0);
 
-        if (client.specification.get<int>() != 'R')
-            throw runtime_error("Expected ring domain");
-        int ring_bits = client.specification.get<int>();
-        int clear_bits = client.specification.get<int>();
-        if (ring_bits != 64 || clear_bits != 64)
-            throw runtime_error("Expected ring64 domain");
+        int domain_kind = client.specification.get<int>();
+        bool use_field_mpc = (domain_kind == 'p');
 
-        send_public_inputs(client, {
-            (long) (((uint64_t) th_ch_sh[0] << 56) | ((uint64_t) th_ch_sh[1] << 48) |
-                    ((uint64_t) th_ch_sh[2] << 40) | ((uint64_t) th_ch_sh[3] << 32) |
-                    ((uint64_t) th_ch_sh[4] << 24) | ((uint64_t) th_ch_sh[5] << 16) |
-                    ((uint64_t) th_ch_sh[6] << 8) | (uint64_t) th_ch_sh[7]),
-            (long) (((uint64_t) th_ch_sh[8] << 56) | ((uint64_t) th_ch_sh[9] << 48) |
-                    ((uint64_t) th_ch_sh[10] << 40) | ((uint64_t) th_ch_sh[11] << 32) |
-                    ((uint64_t) th_ch_sh[12] << 24) | ((uint64_t) th_ch_sh[13] << 16) |
-                    ((uint64_t) th_ch_sh[14] << 8) | (uint64_t) th_ch_sh[15]),
-            (long) (((uint64_t) th_ch_sh[16] << 56) | ((uint64_t) th_ch_sh[17] << 48) |
-                    ((uint64_t) th_ch_sh[18] << 40) | ((uint64_t) th_ch_sh[19] << 32) |
-                    ((uint64_t) th_ch_sh[20] << 24) | ((uint64_t) th_ch_sh[21] << 16) |
-                    ((uint64_t) th_ch_sh[22] << 8) | (uint64_t) th_ch_sh[23]),
-            (long) (((uint64_t) th_ch_sh[24] << 56) | ((uint64_t) th_ch_sh[25] << 48) |
-                    ((uint64_t) th_ch_sh[26] << 40) | ((uint64_t) th_ch_sh[27] << 32) |
-                    ((uint64_t) th_ch_sh[28] << 24) | ((uint64_t) th_ch_sh[29] << 16) |
-                    ((uint64_t) th_ch_sh[30] << 8) | (uint64_t) th_ch_sh[31]),
-        });
+        auto thw = digest_to_words32(th_ch_sh);
+        send_public_inputs_raw64(client, thw);
 
-        auto ss_words = pack_bytes(shared_secret, 4);
-        client.send_private_inputs<Z2<64>>(to_z2(ss_words));
+        if (use_field_mpc)
+        {
+            gfp0::init_field(client.specification.get<bigint>());
+            log("MPC domain: prime field (otls_demo_field); X25519 computed in MPC");
+            vector<gfp0> priv12;
+            auto sh = split_scalar_three_shares(kp.priv.data());
+            for (uint64_t x : sh)
+                priv12.emplace_back((word) x);
+            client.send_private_inputs<gfp0>(priv12);
+            vector<uint8_t> sp32 = server_pub;
+            if (sp32.size() < 32)
+                sp32.resize(32, 0);
+            else if (sp32.size() > 32)
+                sp32.resize(32);
+            send_public_inputs_raw64(client, digest_to_words32(sp32));
+        }
+        else if (domain_kind == 'R')
+        {
+            int ring_bits = client.specification.get<int>();
+            int clear_bits = client.specification.get<int>();
+            if (ring_bits != 64 || clear_bits != 64)
+                throw runtime_error("Expected ring64 domain for otls_demo");
+            auto shared_secret = x25519_derive(kp.priv, server_pub);
+            log("MPC domain: ring; X25519 shared secret computed in ExternalIO client");
+            auto ss_words = pack_bytes(shared_secret, 4);
+            client.send_private_inputs<Z2<64>>(to_z2(ss_words));
+        }
+        else
+            throw runtime_error("Unsupported MPC domain (expected 'p' field or 'R' ring)");
 
-        send_public_inputs(client, {(long) enc_records.size()});
+        send_public_inputs_raw64(client, {(long) enc_records.size()});
         for (auto& rec : enc_records)
         {
             auto words = pack_bytes(rec, MAX_REC_WORDS);
@@ -554,12 +663,12 @@ int main(int argc, char** argv)
             payload.reserve(1 + words.size());
             payload.push_back(rec.size());
             payload.insert(payload.end(), words.begin(), words.end());
-            send_public_inputs(client, payload);
+            send_public_inputs_raw64(client, payload);
         }
-        for (int i = enc_records.size(); i < MAX_HS_RECORDS; ++i)
+        for (size_t i = enc_records.size(); i < (size_t) MAX_HS_RECORDS; ++i)
         {
             vector<long> payload(1 + MAX_REC_WORDS, 0);
-            send_public_inputs(client, payload);
+            send_public_inputs_raw64(client, payload);
         }
 
         log("Waiting for MPC to decrypt server handshake records...");
@@ -567,30 +676,60 @@ int main(int argc, char** argv)
         int n_nst_phase0 = 0;
         for (int ri = 0; ri < MAX_HS_RECORDS; ++ri)
         {
-            auto hs_out = client.receive_outputs<Z2<64>, Z2<64>>(1 + MAX_REC_WORDS);
-            if (ri >= (int) enc_records.size())
+            if (use_field_mpc)
             {
-                log("  HS record " + std::to_string(ri) + ": padding");
-                continue;
-            }
-            int actual_rec_len = enc_records[ri].size();
-            int actual_ct = std::max(0, actual_rec_len - 21);
-            vector<Z2<64>> packed(hs_out.begin() + 1, hs_out.end());
-            auto pt = unpack_words(packed, actual_ct);
-            while (!pt.empty() && pt.back() == 0)
+                auto hs_out = client.receive_outputs<gfp0, gfp0>(1 + MAX_REC_WORDS);
+                if (ri >= (int) enc_records.size())
+                {
+                    log("  HS record " + std::to_string(ri) + ": padding");
+                    continue;
+                }
+                int actual_rec_len = enc_records[ri].size();
+                int actual_ct = std::max(0, actual_rec_len - 21);
+                vector<gfp0> packed(hs_out.begin() + 1, hs_out.end());
+                auto pt = unpack_words_fp(packed, actual_ct);
+                while (!pt.empty() && pt.back() == 0)
+                    pt.pop_back();
+                if (pt.empty())
+                    continue;
+                uint8_t inner_ct = pt.back();
                 pt.pop_back();
-            if (pt.empty())
-                continue;
-            uint8_t inner_ct = pt.back();
-            pt.pop_back();
-            std::ostringstream oss;
-            oss << "  HS record " << ri << ": " << pt.size() << " bytes, inner_ct=0x"
-                    << std::hex << std::setw(2) << std::setfill('0') << (int) inner_ct;
-            log(oss.str());
-            if (inner_ct == 0x16)
-                server_hs_messages.insert(server_hs_messages.end(), pt.begin(), pt.end());
+                std::ostringstream oss;
+                oss << "  HS record " << ri << ": " << pt.size() << " bytes, inner_ct=0x"
+                        << std::hex << std::setw(2) << std::setfill('0') << (int) inner_ct;
+                log(oss.str());
+                if (inner_ct == 0x16)
+                    server_hs_messages.insert(server_hs_messages.end(), pt.begin(), pt.end());
+                else
+                    n_nst_phase0++;
+            }
             else
-                n_nst_phase0++;
+            {
+                auto hs_out = client.receive_outputs<Z2<64>, Z2<64>>(1 + MAX_REC_WORDS);
+                if (ri >= (int) enc_records.size())
+                {
+                    log("  HS record " + std::to_string(ri) + ": padding");
+                    continue;
+                }
+                int actual_rec_len = enc_records[ri].size();
+                int actual_ct = std::max(0, actual_rec_len - 21);
+                vector<Z2<64>> packed(hs_out.begin() + 1, hs_out.end());
+                auto pt = unpack_words(packed, actual_ct);
+                while (!pt.empty() && pt.back() == 0)
+                    pt.pop_back();
+                if (pt.empty())
+                    continue;
+                uint8_t inner_ct = pt.back();
+                pt.pop_back();
+                std::ostringstream oss;
+                oss << "  HS record " << ri << ": " << pt.size() << " bytes, inner_ct=0x"
+                        << std::hex << std::setw(2) << std::setfill('0') << (int) inner_ct;
+                log(oss.str());
+                if (inner_ct == 0x16)
+                    server_hs_messages.insert(server_hs_messages.end(), pt.begin(), pt.end());
+                else
+                    n_nst_phase0++;
+            }
         }
 
         auto transcript = concat(concat(ch, sh_msg), server_hs_messages);
@@ -603,42 +742,41 @@ int main(int argc, char** argv)
         vector<uint8_t> req(req_s.begin(), req_s.end());
         log("HTTP request: " + std::to_string(req.size()) + " bytes");
 
-        send_public_inputs(client, {
-            (long) (((uint64_t) th_sf[0] << 56) | ((uint64_t) th_sf[1] << 48) |
-                    ((uint64_t) th_sf[2] << 40) | ((uint64_t) th_sf[3] << 32) |
-                    ((uint64_t) th_sf[4] << 24) | ((uint64_t) th_sf[5] << 16) |
-                    ((uint64_t) th_sf[6] << 8) | (uint64_t) th_sf[7]),
-            (long) (((uint64_t) th_sf[8] << 56) | ((uint64_t) th_sf[9] << 48) |
-                    ((uint64_t) th_sf[10] << 40) | ((uint64_t) th_sf[11] << 32) |
-                    ((uint64_t) th_sf[12] << 24) | ((uint64_t) th_sf[13] << 16) |
-                    ((uint64_t) th_sf[14] << 8) | (uint64_t) th_sf[15]),
-            (long) (((uint64_t) th_sf[16] << 56) | ((uint64_t) th_sf[17] << 48) |
-                    ((uint64_t) th_sf[18] << 40) | ((uint64_t) th_sf[19] << 32) |
-                    ((uint64_t) th_sf[20] << 24) | ((uint64_t) th_sf[21] << 16) |
-                    ((uint64_t) th_sf[22] << 8) | (uint64_t) th_sf[23]),
-            (long) (((uint64_t) th_sf[24] << 56) | ((uint64_t) th_sf[25] << 48) |
-                    ((uint64_t) th_sf[26] << 40) | ((uint64_t) th_sf[27] << 32) |
-                    ((uint64_t) th_sf[28] << 24) | ((uint64_t) th_sf[29] << 16) |
-                    ((uint64_t) th_sf[30] << 8) | (uint64_t) th_sf[31]),
-        });
+        send_public_inputs_raw64(client, digest_to_words32(th_sf));
         {
             auto req_words = pack_bytes(req, MAX_APP_WORDS);
             vector<long> payload;
             payload.reserve(1 + req_words.size());
             payload.push_back(req.size());
             payload.insert(payload.end(), req_words.begin(), req_words.end());
-            send_public_inputs(client, payload);
+            send_public_inputs_raw64(client, payload);
         }
 
         log("Waiting for MPC to encrypt Client Finished + HTTP GET...");
-        auto fin_out = client.receive_outputs<Z2<64>, Z2<64>>(1 + MAX_APP_WORDS);
-        auto app_out = client.receive_outputs<Z2<64>, Z2<64>>(1 + MAX_APP_WORDS);
-        size_t fin_len = (uint64_t) fin_out[0].get_limb(0);
-        size_t app_len = (uint64_t) app_out[0].get_limb(0);
-        vector<Z2<64>> fin_packed(fin_out.begin() + 1, fin_out.end());
-        vector<Z2<64>> app_packed(app_out.begin() + 1, app_out.end());
-        auto fin_rec = unpack_words(fin_packed, fin_len);
-        auto app_rec = unpack_words(app_packed, app_len);
+        vector<uint8_t> fin_rec, app_rec;
+        if (use_field_mpc)
+        {
+            auto fin_out = client.receive_outputs<gfp0, gfp0>(1 + MAX_APP_WORDS);
+            auto app_out = client.receive_outputs<gfp0, gfp0>(1 + MAX_APP_WORDS);
+            bigint b0 = fin_out[0], b1 = app_out[0];
+            size_t fin_len = b0.get_ui();
+            size_t app_len = b1.get_ui();
+            vector<gfp0> fin_packed(fin_out.begin() + 1, fin_out.end());
+            vector<gfp0> app_packed(app_out.begin() + 1, app_out.end());
+            fin_rec = unpack_words_fp(fin_packed, fin_len);
+            app_rec = unpack_words_fp(app_packed, app_len);
+        }
+        else
+        {
+            auto fin_out = client.receive_outputs<Z2<64>, Z2<64>>(1 + MAX_APP_WORDS);
+            auto app_out = client.receive_outputs<Z2<64>, Z2<64>>(1 + MAX_APP_WORDS);
+            size_t fin_len = (uint64_t) fin_out[0].get_limb(0);
+            size_t app_len = (uint64_t) app_out[0].get_limb(0);
+            vector<Z2<64>> fin_packed(fin_out.begin() + 1, fin_out.end());
+            vector<Z2<64>> app_packed(app_out.begin() + 1, app_out.end());
+            fin_rec = unpack_words(fin_packed, fin_len);
+            app_rec = unpack_words(app_packed, app_len);
+        }
         send_all(sock, fin_rec.data(), fin_rec.size());
         send_all(sock, app_rec.data(), app_rec.size());
 
@@ -673,8 +811,8 @@ int main(int argc, char** argv)
                 resp_records.push_back(rec);
         }
         int srv_app_seq = n_nst_phase0 + nst_in_resp;
-        send_public_inputs(client, {srv_app_seq});
-        send_public_inputs(client, {(long) resp_records.size()});
+        send_public_inputs_raw64(client, {(long) srv_app_seq});
+        send_public_inputs_raw64(client, {(long) resp_records.size()});
         for (int i = 0; i < MAX_RESP_RECORDS; ++i)
         {
             vector<long> payload;
@@ -687,14 +825,32 @@ int main(int argc, char** argv)
             }
             else
                 payload.assign(1 + MAX_APP_WORDS, 0);
-            send_public_inputs(client, payload);
+            send_public_inputs_raw64(client, payload);
         }
 
-        auto resp_out = client.receive_outputs<Z2<64>, Z2<64>>(1 + MAX_APP_WORDS);
-        size_t actual_ct = resp_records.empty() ? (uint64_t) resp_out[0].get_limb(0)
-                                               : (size_t) std::max(0, (int) resp_records[0].size() - 21);
-        vector<Z2<64>> resp_packed(resp_out.begin() + 1, resp_out.end());
-        auto resp_body = unpack_words(resp_packed, std::min((size_t) RESP_CT_BYTES, actual_ct));
+        vector<uint8_t> resp_body;
+        if (use_field_mpc)
+        {
+            auto resp_out = client.receive_outputs<gfp0, gfp0>(1 + MAX_APP_WORDS);
+            size_t actual_ct;
+            if (resp_records.empty())
+            {
+                bigint br = resp_out[0];
+                actual_ct = br.get_ui();
+            }
+            else
+                actual_ct = (size_t) std::max(0, (int) resp_records[0].size() - 21);
+            vector<gfp0> resp_packed(resp_out.begin() + 1, resp_out.end());
+            resp_body = unpack_words_fp(resp_packed, std::min((size_t) RESP_CT_BYTES, actual_ct));
+        }
+        else
+        {
+            auto resp_out = client.receive_outputs<Z2<64>, Z2<64>>(1 + MAX_APP_WORDS);
+            size_t actual_ct = resp_records.empty() ? (uint64_t) resp_out[0].get_limb(0)
+                                                   : (size_t) std::max(0, (int) resp_records[0].size() - 21);
+            vector<Z2<64>> resp_packed(resp_out.begin() + 1, resp_out.end());
+            resp_body = unpack_words(resp_packed, std::min((size_t) RESP_CT_BYTES, actual_ct));
+        }
         while (!resp_body.empty() && resp_body.back() == 0)
             resp_body.pop_back();
         if (!resp_body.empty())
@@ -706,7 +862,7 @@ int main(int argc, char** argv)
     }
     catch (std::exception& e)
     {
-        cerr << "[gateway-cpp] ERROR: " << e.what() << std::endl;
+        cerr << "[otls-external-io] ERROR: " << e.what() << std::endl;
         return 1;
     }
 }

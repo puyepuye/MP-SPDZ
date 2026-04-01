@@ -88,7 +88,7 @@ offline: $(OT_EXE) Check-Offline.x mascot-offline.x cowgear-offline.x lowgear-of
 
 gen_input: gen_input_f2n.x gen_input_fp.x
 
-externalIO: bankers-bonus-client.x
+externalIO: bankers-bonus-client.x otls-external-io-client.x
 
 bmr: bmr-program-party.x bmr-program-tparty.x
 
@@ -198,6 +198,9 @@ bmr-clean:
 	-rm BMR/*.o BMR/*/*.o GC/*.o
 
 bankers-bonus-client.x: ExternalIO/bankers-bonus-client.o $(COMMON)
+	$(CXX) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+otls-external-io-client.x: ExternalIO/otls_external_io_client.o $(COMMON)
 	$(CXX) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 simple-offline.x: $(FHEOFFLINE)

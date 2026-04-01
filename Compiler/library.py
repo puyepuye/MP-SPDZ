@@ -1878,6 +1878,14 @@ def get_player_id():
     playerid(res._v)
     return res
 
+def otls_connection_role(role):
+    """ In-process OTLS hook: C++ ``OtlsConnection::log_role(my_party, role)``.
+
+    Use with ``@if_(get_player_id() == k)`` when only one party should run TCP later.
+    Convention: ``role=0`` (hello / outbound control), ``role=1`` (socket owner), etc.
+    """
+    instructions.otls_conn_role(role)
+
 def listen_for_clients(port):
     """ Listen for clients on specific port base.
 

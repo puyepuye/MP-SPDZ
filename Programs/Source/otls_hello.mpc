@@ -1,0 +1,7 @@
+# Minimal entry: in-process OTLS hook (C++ sees party id + role).
+# Full TLS still uses ExternalIO client binary until TCP is moved into party VM.
+from Compiler.library import print_ln, get_player_id, otls_connection_role
+
+print_ln('otls_hello: start')
+otls_connection_role(0)
+print_ln('otls_hello: player %s', get_player_id())

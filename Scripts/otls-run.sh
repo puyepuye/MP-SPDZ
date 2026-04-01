@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch MPC parties + gateway in one go.
+# Launch replicated-ring MPC parties + C++ ExternalIO TLS client (otls-external-io-client.x).
 # Usage: ./Scripts/otls-run.sh [host] [port] [path]
 
 set -e
@@ -12,21 +12,21 @@ PORT="${2:-443}"
 PATH_ARG="${3:-/v3.1/name/deutschland}"
 MPC_PORT=18000
 PARTY_PORT=14000
+PROGRAM="${OTLS_PROGRAM:-otls_demo}"
 
-# Start gateway first — it connects to the TLS server and reads HS records,
-# then retries MPC connection until parties are ready.
-echo "=== Starting gateway: $HOST:$PORT$PATH_ARG ==="
-python3 ExternalIO/otls_gateway.py "$HOST" "$PORT" "$PATH_ARG" "$MPC_PORT" &
-GW_PID=$!
-
-# Give the gateway a moment to start the TLS handshake before MPC parties.
-sleep 2
+echo "=== Building C++ ExternalIO TLS client ==="
+make -j2 otls-external-io-client.x >/dev/null
 
 echo "=== Starting 3 replicated-ring parties (inter-party port $PARTY_PORT, client port $MPC_PORT) ==="
-PORT=$PARTY_PORT ./Scripts/ring.sh otls_demo &
+PORT=$PARTY_PORT ./Scripts/ring.sh "$PROGRAM" &
 MPC_PID=$!
 
-wait $GW_PID 2>/dev/null
+echo "=== Waiting for MPC parties to initialize ==="
+sleep 4
+
+echo "=== Starting C++ bridge: $HOST:$PORT$PATH_ARG ==="
+./otls-external-io-client.x "$HOST" "$PORT" "$PATH_ARG" "$MPC_PORT"
 GW_EXIT=$?
+
 wait $MPC_PID 2>/dev/null || true
-echo "=== Done (gateway exit=$GW_EXIT) ==="
+echo "=== Done (bridge exit=$GW_EXIT) ==="
