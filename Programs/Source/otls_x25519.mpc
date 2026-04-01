@@ -1,0 +1,215 @@
+"""
+OTLS X25519 foundation helpers for MPC integration.
+
+This module intentionally starts with:
+1) scalar clamping helpers,
+2) little-endian conversion helpers,
+3) field-prime constants and reduction helpers for p = 2^255 - 19.
+
+The full Montgomery ladder implementation is added in follow-up steps.
+"""
+
+from Compiler.GC.types import sbitint
+
+# Curve25519 prime
+P25519 = (1 << 255) - 19
+A24 = 121665
+FE_N = 520
+FE = sbitint.get_type(FE_N)
+
+
+def _u8_bits_from_regint(byte_r):
+    """Return byte bits in little-endian bit order (b0..b7)."""
+    return [sbit((byte_r >> regint(i)) % 2) for i in range(8)]
+
+
+def _regint_from_u8_bits_le(bits8):
+    """Inverse of _u8_bits_from_regint."""
+    v = regint(0)
+    for i in range(8):
+        v = v + regint(bits8[i].reveal()) * regint(1 << i)
+    return v
+
+
+def sint_words_be_to_bits_le(words):
+    """
+    Convert 4 sint words (packed as 8-byte big-endian chunks) to 256 bits (LSB-first).
+    This matches the gateway's packing/unpacking convention.
+    """
+    sb64 = sbitint.get_type(64)
+    bits_le = []
+    for w in range(4):
+        chunk_bits_le = sb64(words[w]).bit_decompose()  # least-significant bit first
+        # chunk is numerically big-endian bytes, so bytes are reversed in significance.
+        # Reorder to recover original byte stream order.
+        for b in range(8):
+            src = (7 - b) * 8
+            bits_le.extend(chunk_bits_le[src:src + 8])
+    return bits_le
+
+
+def bits_le_to_sint_words_be(bits_le):
+    """
+    Inverse of sint_words_be_to_bits_le: pack 256 LSB-first bits into 4 sint words
+    where each word encodes 8 original bytes in big-endian.
+    """
+    out = Array(4, sint)
+    for w in range(4):
+        # collect 8 bytes in original byte order
+        bytes_bits = []
+        for b in range(8):
+            off = (w * 8 + b) * 8
+            bytes_bits.append(bits_le[off:off + 8])
+        # place bytes into big-endian integer: b0 is most significant byte
+        chunk_bits_le = [sbit(0)] * 64
+        for b in range(8):
+            dst = (7 - b) * 8
+            chunk_bits_le[dst:dst + 8] = bytes_bits[b]
+        sb64 = sbitint.get_type(64).bit_compose(chunk_bits_le)
+        out[w] = sint(sb64.reveal())
+    return out
+
+
+def x25519_clamp_bits_le(k_bits_le):
+    """
+    RFC7748 clamping on 256 LSB-first bits:
+      k[0]  &= 248 (clear bits 0,1,2)
+      k[31] &= 127 (clear bit 255)
+      k[31] |= 64  (set bit 254)
+    """
+    out = list(k_bits_le[:256])
+    out[0] = sbit(0)
+    out[1] = sbit(0)
+    out[2] = sbit(0)
+    out[255] = sbit(0)
+    out[254] = sbit(1)
+    return out
+
+
+def x25519_clamp_sint_words_be(words):
+    """Clamp scalar represented as 4 sint words in gateway wire packing."""
+    bits = sint_words_be_to_bits_le(words)
+    clamped = x25519_clamp_bits_le(bits)
+    return bits_le_to_sint_words_be(clamped)
+
+
+def _public_reduce_25519(x):
+    """
+    Public (regint/int) reduction helper for test scaffolding.
+    Not used for secret ladder yet.
+    """
+    return x % P25519
+
+
+def _regint_words_to_bits_le(words):
+    bits = []
+    for w in range(4):
+        word = words[w]
+        for b in range(8):
+            byte_r = (word >> regint(8 * b)) % 256
+            bits.extend(_u8_bits_from_regint(byte_r))
+    return bits[:256]
+
+
+def _bits_le_to_fe(bits, n_bits=255):
+    bb = list(bits[:n_bits]) + [sbit(0)] * (FE_N - n_bits)
+    return FE.bit_compose(bb)
+
+
+def _fe_to_bits_le_32(x):
+    bits = x.bit_decompose(FE_N)
+    out = list(bits[:255]) + [sbit(0)]
+    return out
+
+
+def _fe_mod(x):
+    """
+    x mod p with p public constant. Uses secret integer division primitive.
+    """
+    p = FE(P25519)
+    q = x.int_div(p, bit_length=FE_N)
+    r = x - q * p
+    r = (r < FE(0)).if_else(r + p, r)
+    r = (r >= p).if_else(r - p, r)
+    return r
+
+
+def fe_add(a, b):
+    return _fe_mod(a + b)
+
+
+def fe_sub(a, b):
+    return _fe_mod(a - b)
+
+
+def fe_mul(a, b):
+    return _fe_mod(a * b)
+
+
+def _cswap(swap_bit, a, b):
+    na = swap_bit.if_else(b, a)
+    nb = swap_bit.if_else(a, b)
+    return na, nb
+
+
+def _fe_pow_public(a, e):
+    r = FE(1)
+    base = a
+    for i in range(e.bit_length() - 1, -1, -1):
+        r = fe_mul(r, r)
+        if (e >> i) & 1:
+            r = fe_mul(r, base)
+    return r
+
+
+def fe_inv(a):
+    return _fe_pow_public(a, P25519 - 2)
+
+
+def x25519_shared_secret_words(client_scalar_words_sint, server_pub_words_regint):
+    """
+    Compute X25519 shared secret inside MPC from:
+      - secret client scalar (4 sint words, gateway wire packing)
+      - public server u-coordinate (4 regint words, little-endian bytes packed in words)
+    Returns: 4 sint words (same packing used by existing OTLS path).
+    """
+    k_bits = sint_words_be_to_bits_le(client_scalar_words_sint)[:256]
+    k_bits = x25519_clamp_bits_le(k_bits)
+
+    u_bits = _regint_words_to_bits_le(server_pub_words_regint)[:256]
+    u_bits[255] = sbit(0)  # RFC7748 decode: ignore top bit
+    x1 = _bits_le_to_fe(u_bits, 255)
+
+    x2 = FE(1)
+    z2 = FE(0)
+    x3 = x1
+    z3 = FE(1)
+    swap = sbit(0)
+
+    for t in range(254, -1, -1):
+        kt = k_bits[t]
+        swap = swap ^ kt
+        x2, x3 = _cswap(swap, x2, x3)
+        z2, z3 = _cswap(swap, z2, z3)
+        swap = kt
+
+        A = fe_add(x2, z2)
+        AA = fe_mul(A, A)
+        B = fe_sub(x2, z2)
+        BB = fe_mul(B, B)
+        E = fe_sub(AA, BB)
+        C = fe_add(x3, z3)
+        D = fe_sub(x3, z3)
+        DA = fe_mul(D, A)
+        CB = fe_mul(C, B)
+        x3 = fe_mul(fe_add(DA, CB), fe_add(DA, CB))
+        z3 = fe_mul(x1, fe_mul(fe_sub(DA, CB), fe_sub(DA, CB)))
+        x2 = fe_mul(AA, BB)
+        z2 = fe_mul(E, fe_add(AA, fe_mul(FE(A24), E)))
+
+    x2, x3 = _cswap(swap, x2, x3)
+    z2, z3 = _cswap(swap, z2, z3)
+
+    out = fe_mul(x2, fe_inv(z2))
+    out_bits = _fe_to_bits_le_32(out)
+    return bits_le_to_sint_words_be(out_bits)
