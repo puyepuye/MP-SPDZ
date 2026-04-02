@@ -3,7 +3,8 @@
 # Wire order: MPC X25519 field path. TLS runs in the ExternalIO client only.
 # Usage: ./Scripts/otls-run-field.sh [host] [port] [path]
 #
-# Requires: make MOD='-DGFP_MOD_SZ=5' for both replicated-field-party.x and otls-external-io-client.x (same gfp limbs).
+# 253-bit prime p: need GFP_MOD_SZ = ceil(253/64) = 4 (see CONFIG / gfp.h).
+# Override with OTLS_MOD if needed; field party + ExternalIO client + libSPDZ must all match.
 
 set -e
 HERE=$(cd "$(dirname "$0")"; pwd)
@@ -16,7 +17,7 @@ PATH_ARG="${3:-/v3.1/name/deutschland}"
 MPC_PORT=18000
 PRIME=57896044618658097711785492504343953926634992332820282019728792003956564819949
 PROGRAM="otls_demo_field"
-MOD="-DGFP_MOD_SZ=5"
+MOD="-DGFP_MOD_SZ=4"
 [ -n "${OTLS_MOD:-}" ] && MOD="$OTLS_MOD"
 
 echo "=== Compile field-mode program ==="
@@ -27,6 +28,10 @@ else
 fi
 
 echo "=== Ensure field party + C++ bridge (MOD=$MOD) ==="
+# If you previously built with another GFP_MOD_SZ, stale libSPDZ.so can mismatch the client.
+if [ "${OTLS_FIELD_REBUILD:-0}" = "1" ]; then
+  rm -f libSPDZ.so ExternalIO/otls_external_io_client.o Machines/replicated-field-party.o
+fi
 make -j2 MOD="$MOD" replicated-field-party.x otls-external-io-client.x >/dev/null
 
 echo "=== Starting 3 replicated-field parties (must listen before bridge connects) ==="

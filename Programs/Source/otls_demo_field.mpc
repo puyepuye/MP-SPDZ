@@ -1,15 +1,34 @@
 """
 OTLS TLS 1.3 Handshake (field-mode): X25519 shared secret computed inside MPC.
 
-ExternalIO (gateway must match order):
+This is *not* classical finite-field DH (g^a mod p). X25519 is Diffie–Hellman on
+Curve25519: each side has a scalar k and a Montgomery u-coordinate; the shared
+secret is the u-coordinate of k * Q (RFC 7748), computed here with a Montgomery
+ladder in the prime field mod p = 2^255 - 19.
+
+Secret sharing (what this file does):
+  - The *client scalar* k (32-byte clamped private key) is represented as three
+    *additive* shares mod 2^256: k = k0 + k1 + k2 (mod 2^256). Each share arrives
+    as 4 x 64-bit BE words of private sint (12 words total) via
+    sint.receive_from_client(...).
+  - Those shares are *recombined inside MPC* (see add_three_scalar_shares_bits)
+    to 256 scalar bits; no single party’s transcript needs the full k in clear.
+  - Today the ExternalIO client often *splits* one local key into k0,k1,k2 for
+    wiring; a future variant can have each party supply one share from its own input.
+
+Where the "shared secret" appears:
+  - x25519_ladder_bits_scalar(k_bits, u) computes the X25519 output (Montgomery
+    u-coordinate of the ECDH result) as a field element out_x.
+  - field_x25519_out_to_ss_bv(out_x) turns that into a 32-byte sbitvec ss_bv —
+    that byte string is what TLS 1.3 uses as IKM into HKDF together with the
+    transcript hashes (derive_hs_keys / derive_app_keys in otls_crypto.mpc).
+
+ExternalIO (client must match order):
   1) transcript SHA-256(CH||SH): 4 public words — send_public_inputs_raw64
   2) client scalar as 3 additive shares mod 2^256: 12 private sint words
-     (each share = 4 x 64-bit BE words; gateway splits raw 32-byte key).
+     (each share = 4 x 64-bit BE words; client splits raw 32-byte key).
   3) server X25519 public key: 4 public regint words (BE chunks)
   4) encrypted HS records, then th_sf, HTTP, response — raw64 public
-
-Shares are reconstructed in MPC (bitwise add mod 2) before the Montgomery ladder.
-Independent parties would each supply one share via separate clients (future).
 
 Compile: ./compile.py -F 253 -P <Curve25519 prime>
 Run: replicated-field-party.x with same -P at runtime.
@@ -33,6 +52,10 @@ for _n in _CRYPTO_EXPORTS:
 derive_hs_keys = derive_hs_keys_from_th_hash
 derive_app_keys = derive_app_keys_from_th_hash
 
+# Avoid allocator reordering of memory ops (warning: "Order of memory instructions not
+# preserved") — can miscompile Array-heavy crypto and yield wrong HS keys / garbage TLS.
+program.options.preserve_mem_order = True
+
 P25519 = (1 << 255) - 19
 A24 = 121665
 
@@ -47,9 +70,12 @@ HS_CT_BYTES = REC_BUF_BYTES - 21
 RESP_CT_BYTES = APP_BUF_BYTES - 21
 REQ_MAX_BYTES = 256
 
+# --- Scalar share packing (wire format from ExternalIO client) ----------------
+# Each share is four 64-bit big-endian words = 256 bits of that share.
+
 
 def sint_words_be_to_bits_le(words4):
-    """4 sint BE words -> 256 LSB-first bits (matches gateway scalar packing)."""
+    """4 sint BE words -> 256 LSB-first bits (matches client scalar packing)."""
     sb64 = sbitint.get_type(64)
     bits_le = []
     for w in range(4):
@@ -66,7 +92,10 @@ def _cswap_field(bit, a, b):
 
 
 def regint_words_to_u_sint(words4):
-    """32-byte LE X25519 u-coordinate -> field sint (same as otls_x25519_prime_test hex_le_to_sint)."""
+    """Decode server's X25519 public key u from 4 regint words (32-byte LE u-coordinate).
+
+    This is the peer Montgomery point (u only); it is *public* on the wire.
+    """
     v = sint(0)
     for i in range(31, -1, -1):
         w = i // 8
@@ -77,7 +106,16 @@ def regint_words_to_u_sint(words4):
 
 
 def x25519_ladder_bits_scalar(k_bits_in, u_elem):
-    """Montgomery ladder; k_bits_in = 256 LSB-first scalar bits (sint or sbit); u = server public."""
+    """X25519: compute shared Montgomery u-coordinate for scalar k on peer public u_elem.
+
+    This is the curve analogue of DH: result = X25519(k, u) (RFC 7748), using a
+    constant-time Montgomery ladder in F_p, p = 2^255-19. Inputs:
+      k_bits_in: 256 scalar bits (LSB first) — the recombined private scalar.
+      u_elem:    field element for server's u-coordinate.
+    Returns: field element = shared secret *before* byte serialization (then fixed
+    in field_x25519_out_to_ss_bv). Classical "g^a mod p" does not apply; this is
+    elliptic-curve scalar multiplication in the Montgomery model.
+    """
     kb = [sint(k_bits_in[i]) for i in range(256)]
     kb[0] = sint(0)
     kb[1] = sint(0)
@@ -109,8 +147,12 @@ def x25519_ladder_bits_scalar(k_bits_in, u_elem):
         D = x3 - z3
         DA = D * A
         CB = C * B
-        x3 = (DA + CB) * (DA + CB)
-        z3 = x1 * (DA - CB) * (DA - CB)
+        ApB = DA + CB
+        x3 = ApB * ApB
+        # z3 = x1 * (DA-CB)^2 mod p — must square (DA-CB) before multiplying by x1;
+        # x1*(DA-CB)*(DA-CB) would associate as (x1*(DA-CB))*(DA-CB), which is wrong mod p.
+        DmC = DA - CB
+        z3 = x1 * (DmC * DmC)
         x2 = AA * BB
         z2 = E * (AA + sint(A24) * E)
 
@@ -128,30 +170,45 @@ def x25519_ladder_bits_scalar(k_bits_in, u_elem):
 
 
 def field_x25519_out_to_ss_bv(out):
-    """Field element -> 32-byte MSB-first sbitvec for otls_crypto."""
-    out = (out < sint(0)).if_else(out + sint(P25519), out)
+    """Same HKDF bit order as sint_chunks_to_bv(pack_bytes(LE secret)) / otls_demo ring path.
+
+    bits_le[i] is bit i of integer V (LSB at i=0). Ring code builds the sbitvec as
+    reversed(sb64(word).bit_decompose()) per 64-bit BE word — i.e. per byte of the
+    secret, bits MSB..LSB (big-endian bit order within each byte), bytes in order
+    b[0]..b[31]. Equivalently: for each byte index j, append bits_le[8*j+7]..bits_le[8*j].
+
+    Do this in the sbit domain only; rebuilding sint words with sint(bits_le[i]) can
+    mis-compile and yield wrong keys even when the algebra matches pack_bytes.
+    """
+    v = (out < sint(0)).if_else(out + sint(P25519), out)
     sb255 = sbitint.get_type(255)
-    bits_le = sb255(out).bit_decompose() + [sbit(0)]
-    out_bits = []
-    for byte_i in range(32):
-        base = byte_i * 8
-        for bit_i in range(7, -1, -1):
-            out_bits.append(bits_le[base + bit_i])
-    return sbitvec.from_vec(out_bits)
+    bits_le = sb255(v).bit_decompose() + [sbit(0)]
+    bits = []
+    for byte_idx in range(32):
+        for i in range(7, -1, -1):
+            bits.append(bits_le[byte_idx * 8 + i])
+    return sbitvec.from_vec(bits)
+
+
+def _add256_mod(a_bits, b_bits):
+    """(a + b) mod 2^256; a_bits,b_bits are 256 LSB-first sbits (unsigned)."""
+    sb257 = sbitint.get_type(257)
+    pad1 = [sbit(0)]
+    a = sb257.bit_compose(a_bits[:256] + pad1)
+    b = sb257.bit_compose(b_bits[:256] + pad1)
+    s = a + b
+    return s.bit_decompose()[:256]
 
 
 def add_three_scalar_shares_bits(b0, b1, b2):
+    """Recombine three additive shares mod 2^256 (unsigned), LSB-first bits per share.
+
+    Per-bit gfp ``sint`` add is unsafe (mod p, not Z). One wide ``a+b+c`` on ``sbitint``
+    is easy to get wrong (signed range / semantics).  Instead:
+    ``((b0+b1) mod 2^256 + b2) mod 2^256 = (b0+b1+b2) mod 2^256`` using 257-bit adds.
     """
-    b0,b1,b2: 256 LSB-first bits per share; additive shares mod 2^256.
-    Carry via s >> 1 (int_div(..., bit_length=4) broke the reconstructed scalar).
-    """
-    carry = sint(0)
-    out = []
-    for i in range(256):
-        s = sint(b0[i]) + sint(b1[i]) + sint(b2[i]) + carry
-        out.append(s % 2)
-        carry = s >> 1
-    return out
+    ab = _add256_mod(b0, b1)
+    return _add256_mod(ab, b2)
 
 
 def regint_words_to_bv(words, n_bytes):
@@ -192,10 +249,13 @@ print_ln('otls(field): waiting on port %s', PORTNUM)
 cid = accept_client_connection(PORTNUM)
 print_ln('otls(field): gateway connected')
 
+# --- Public transcript hash th(CH||SH) (TLS exporter labels use this later) ---
 th_ch_sh_w = regint.read_from_socket(cid, 4)
 th_bv = regint_words_to_bv(th_ch_sh_w, 32)
 
-# Three additive shares of the client scalar (each 4 words); reconstruct mod 2^256.
+# --- Secret-shared client scalar: 3 additive shares mod 2^256, then X25519 --------
+# receive_from_client: 12 private sint words = masked triples from preprocessing;
+# protocol reconstructs additive shares of the scalar k across parties.
 scalar_inp = sint.receive_from_client(12, cid)
 share0 = [scalar_inp[i] for i in range(4)]
 share1 = [scalar_inp[i] for i in range(4, 8)]
@@ -203,11 +263,15 @@ share2 = [scalar_inp[i] for i in range(8, 12)]
 bits0 = sint_words_be_to_bits_le(share0)
 bits1 = sint_words_be_to_bits_le(share1)
 bits2 = sint_words_be_to_bits_le(share2)
+# k_bits = recombined scalar bits (still secret-shared in the computation).
 k_bits = add_three_scalar_shares_bits(bits0, bits1, bits2)
 
+# Peer's public key u (from ServerHello key_share); public regint words from client.
 server_pub = regint.read_from_socket(cid, 4)
 u = regint_words_to_u_sint(server_pub)
+# ECDH in MPC: out_x is the X25519 shared field element (Montgomery u output).
 out_x = x25519_ladder_bits_scalar(k_bits, u)
+# ss_bv = 32-byte shared secret as bits — the TLS 1.3 ECDH IKM for HKDF in derive_*.
 ss_bv = field_x25519_out_to_ss_bv(out_x)
 
 n_enc = regint.read_from_socket(cid)
@@ -217,6 +281,7 @@ for i in range(MAX_HS_RECORDS):
     h = regint.read_from_socket(cid, 1 + REC_BUF_WORDS)
     rec_data.append(h)
 
+# --- HKDF / handshake keys: IKM = ss_bv from X25519 above + transcript th_bv ---
 print_ln('otls(field): deriving HS keys')
 hs_sec, s_key, s_iv, c_key, c_iv, fin_key = derive_hs_keys(ss_bv, th_bv)
 print_ln('otls(field): HS keys done')
@@ -246,6 +311,7 @@ vd = hmac_sha256(fin_key, th_sf_bv)
 fin_msg = bv_cat(bv_hex('14000020'), vd)
 fin_rec, fin_rec_len = build_tls_record(c_key, c_iv, 0, fin_msg, 36, 0x16)
 
+# Application traffic keys (still derived from same hs_sec / transcript chain).
 ck, ci, sk, si = derive_app_keys(hs_sec, th_sf_bv)
 app_rec, app_rec_len = build_tls_record(ck, ci, 0, req_bv, REQ_MAX_BYTES, 0x17)
 
