@@ -283,6 +283,16 @@ void BaseInstruction::parse_operands(istream& s, int pos, int file_pos)
         n = get_int(s);
         break;
       case OTLS_CONN_ROLE:
+      case OTLS_TCP_CONNECT:
+        n = get_int(s);
+        break;
+      case OTLS_TCP_CLOSE:
+      case OTLS_TLS_CLIENTHELLO_POC:
+        break;
+      case OTLS_TCP_BCAST_SEND:
+      case OTLS_TCP_BCAST_RECV:
+      case OTLS_TCP_BCAST_RECV_TLS_RECORD:
+        r[0] = get_int(s);
         n = get_int(s);
         break;
       // instructions with no operand
@@ -580,6 +590,7 @@ int BaseInstruction::get_reg_type() const
     case POPINT:
     case MOVINT:
     case READSOCKETINT:
+    case OTLS_TCP_BCAST_SEND:
     case WRITESOCKETINT:
     case INITCLIENTCONNECTION:
     case INITSECURESOCKET:
@@ -601,6 +612,8 @@ int BaseInstruction::get_reg_type() const
     case GENSECSHUFFLE:
     case CMDLINEARG:
     case CALL_TAPE:
+    case OTLS_TCP_BCAST_RECV:
+    case OTLS_TCP_BCAST_RECV_TLS_RECORD:
       return INT;
     case PREP:
     case GPREP:
@@ -612,6 +625,8 @@ int BaseInstruction::get_reg_type() const
       // those use r[] not for registers
       return NONE;
     case OTLS_CONN_ROLE:
+    case OTLS_TCP_CONNECT:
+    case OTLS_TCP_CLOSE:
       return NONE;
     case LDI:
     case LDMC:
@@ -1327,6 +1342,24 @@ inline void Instruction::execute(Processor<sint, sgf2n>& Proc) const
         break;
       case OTLS_CONN_ROLE:
         OtlsConnection::log_role(Proc.P.my_num(), n);
+        break;
+      case OTLS_TCP_CONNECT:
+        OtlsConnection::tcp_connect(Proc.P.my_num(), n);
+        break;
+      case OTLS_TCP_CLOSE:
+        OtlsConnection::tcp_close(Proc.P.my_num());
+        break;
+      case OTLS_TLS_CLIENTHELLO_POC:
+        OtlsConnection::send_tls_client_hello_poc(Proc.P.my_num());
+        break;
+      case OTLS_TCP_BCAST_SEND:
+        OtlsConnection::tcp_bcast_send(Proc, Proc.P.my_num(), n, r[0], size);
+        break;
+      case OTLS_TCP_BCAST_RECV:
+        OtlsConnection::tcp_bcast_recv(Proc, Proc.P, Proc.P.my_num(), n, r[0], size);
+        break;
+      case OTLS_TCP_BCAST_RECV_TLS_RECORD:
+        OtlsConnection::tcp_bcast_recv_tls_record(Proc, Proc.P, Proc.P.my_num(), n, r[0], size);
         break;
       case CMDLINEARG:
         {

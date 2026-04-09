@@ -1,4 +1,7 @@
+// Full TLS+MPC bridge (ExternalIO). In-VM TCP on party 1 lives in Processor/OtlsConnection.*
+// and is exercised by Programs/Source/otls_tcp_poc.mpc — migrate otls_demo_field here incrementally.
 #include "Client.hpp"
+#include "otls_wire_format.hpp"
 #include "Math/Setup.h"
 #include "Math/Z2k.h"
 #include "Math/Z2k.hpp"
@@ -18,6 +21,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -129,15 +133,28 @@ void send_all(int fd, const uint8_t* data, size_t len)
     }
 }
 
-void recv_exact(int fd, uint8_t* data, size_t len)
+void recv_exact(int fd, uint8_t* data, size_t len, const string& what)
 {
     size_t got = 0;
     while (got < len)
     {
         ssize_t rc = recv(fd, data + got, len - got, 0);
-        if (rc <= 0)
-            throw runtime_error("connection closed while receiving");
-        got += rc;
+        if (rc == 0)
+        {
+            std::ostringstream oss;
+            oss << what << ": peer closed TCP (EOF) after " << got << "/" << len << " bytes";
+            if (got == 0 && len == 5)
+                oss << " (expected next TLS record header; server often sends alert then closes if Client Finished / app data failed MAC/decrypt)";
+            throw runtime_error(oss.str());
+        }
+        if (rc < 0)
+        {
+            std::ostringstream oss;
+            oss << what << ": recv() failed after " << got << "/" << len << " bytes: "
+                << strerror(errno) << " (errno=" << errno << ")";
+            throw runtime_error(oss.str());
+        }
+        got += (size_t) rc;
     }
 }
 
@@ -152,12 +169,17 @@ TLSRecord read_tls_record(int sock)
 {
     TLSRecord rec;
     rec.header.resize(5);
-    recv_exact(sock, rec.header.data(), rec.header.size());
+    recv_exact(sock, rec.header.data(), rec.header.size(), "TLS record header (5 B)");
     rec.type = rec.header[0];
     uint16_t len = ((uint16_t) rec.header[3] << 8) | rec.header[4];
     rec.payload.resize(len);
     if (len > 0)
-        recv_exact(sock, rec.payload.data(), len);
+    {
+        std::ostringstream oss;
+        oss << "TLS record payload (" << (unsigned) len << " B, type=0x" << std::hex
+            << std::setw(2) << std::setfill('0') << (unsigned) rec.type << std::dec << ")";
+        recv_exact(sock, rec.payload.data(), len, oss.str());
+    }
     return rec;
 }
 
@@ -400,28 +422,6 @@ vector<uint8_t> x25519_derive(const std::array<uint8_t, 32>& priv, const vector<
     return out;
 }
 
-vector<long> pack_bytes(const vector<uint8_t>& data, int max_words)
-{
-    vector<long> words;
-    for (size_t i = 0; i < data.size(); i += 8)
-    {
-        uint64_t w = 0;
-        for (int j = 0; j < 8; ++j)
-        {
-            w <<= 8;
-            size_t idx = i + j;
-            if (idx < data.size())
-                w |= data[idx];
-        }
-        words.push_back((long) w);
-    }
-    while ((int) words.size() < max_words)
-        words.push_back(0);
-    if ((int) words.size() > max_words)
-        words.resize(max_words);
-    return words;
-}
-
 vector<uint8_t> unpack_words(const vector<Z2<64>>& vals, size_t length)
 {
     vector<uint8_t> out;
@@ -472,76 +472,6 @@ void send_public_inputs_raw64(Client& client, const vector<long>& values)
     }
     for (auto* socket : client.sockets)
         os.Send(socket);
-}
-
-void add_mod256(const uint8_t* a, const uint8_t* b, uint8_t* out)
-{
-    uint16_t c = 0;
-    for (int i = 0; i < 32; i++)
-    {
-        c = (uint16_t) c + a[i] + b[i];
-        out[i] = (uint8_t) (c & 0xff);
-        c >>= 8;
-    }
-}
-
-void sub_mod256(const uint8_t* k, const uint8_t* s, uint8_t* out)
-{
-    int borrow = 0;
-    for (int i = 0; i < 32; i++)
-    {
-        int v = (int) k[i] - (int) s[i] - borrow;
-        if (v < 0)
-        {
-            v += 256;
-            borrow = 1;
-        }
-        else
-            borrow = 0;
-        out[i] = (uint8_t) v;
-    }
-}
-
-/** 256-bit integer (LE) -> 4 x 64-bit BE words (matches Python scalar_int_to_be_words). */
-vector<uint64_t> scalar_le_to_be_words(const uint8_t* le32)
-{
-    vector<uint64_t> w(4);
-    for (int i = 0; i < 4; i++)
-    {
-        uint64_t x = 0;
-        for (int j = 0; j < 8; j++)
-            x = (x << 8) | le32[i * 8 + j];
-        w[i] = x;
-    }
-    return w;
-}
-
-/** Three additive shares mod 2^256 -> 12 BE words for otls_demo_field private inputs. */
-vector<uint64_t> split_scalar_three_shares(const uint8_t* priv_le32)
-{
-    uint8_t r0[32], r1[32], r2[32], sum01[32];
-    if (RAND_bytes(r0, 32) != 1 || RAND_bytes(r1, 32) != 1)
-        throw runtime_error("RAND_bytes failed");
-    add_mod256(r0, r1, sum01);
-    sub_mod256(priv_le32, sum01, r2);
-
-    vector<uint64_t> out;
-    auto w0 = scalar_le_to_be_words(r0);
-    auto w1 = scalar_le_to_be_words(r1);
-    auto w2 = scalar_le_to_be_words(r2);
-    out.insert(out.end(), w0.begin(), w0.end());
-    out.insert(out.end(), w1.begin(), w1.end());
-    out.insert(out.end(), w2.begin(), w2.end());
-    return out;
-}
-
-vector<long> digest_to_words32(const vector<uint8_t>& d)
-{
-    auto u = scalar_le_to_be_words(d.data());
-    vector<long> w;
-    for (uint64_t x : u)
-        w.push_back((long) (int64_t) x);
-    return w;
 }
 
 vector<uint8_t> unpack_words_fp(const vector<gfp0>& vals, size_t length)
@@ -622,7 +552,7 @@ int main(int argc, char** argv)
         int domain_kind = client.specification.get<int>();
         bool use_field_mpc = (domain_kind == 'p');
 
-        auto thw = digest_to_words32(th_ch_sh);
+        auto thw = otls_wire::digest_to_words32(th_ch_sh);
         send_public_inputs_raw64(client, thw);
 
         if (use_field_mpc)
@@ -630,7 +560,7 @@ int main(int argc, char** argv)
             gfp0::init_field(client.specification.get<bigint>());
             log("MPC domain: prime field (otls_demo_field); X25519 computed in MPC");
             vector<gfp0> priv12;
-            auto sh = split_scalar_three_shares(kp.priv.data());
+            auto sh = otls_wire::split_scalar_three_shares(kp.priv.data());
             for (uint64_t x : sh)
                 priv12.emplace_back((word) x);
             client.send_private_inputs<gfp0>(priv12);
@@ -639,7 +569,7 @@ int main(int argc, char** argv)
                 sp32.resize(32, 0);
             else if (sp32.size() > 32)
                 sp32.resize(32);
-            send_public_inputs_raw64(client, digest_to_words32(sp32));
+            send_public_inputs_raw64(client, otls_wire::digest_to_words32(sp32));
         }
         else if (domain_kind == 'R')
         {
@@ -649,7 +579,7 @@ int main(int argc, char** argv)
                 throw runtime_error("Expected ring64 domain for otls_demo");
             auto shared_secret = x25519_derive(kp.priv, server_pub);
             log("MPC domain: ring; X25519 shared secret computed in ExternalIO client");
-            auto ss_words = pack_bytes(shared_secret, 4);
+            auto ss_words = otls_wire::pack_bytes(shared_secret, 4);
             client.send_private_inputs<Z2<64>>(to_z2(ss_words));
         }
         else
@@ -658,7 +588,7 @@ int main(int argc, char** argv)
         send_public_inputs_raw64(client, {(long) enc_records.size()});
         for (auto& rec : enc_records)
         {
-            auto words = pack_bytes(rec, MAX_REC_WORDS);
+            auto words = otls_wire::pack_bytes(rec, MAX_REC_WORDS);
             vector<long> payload;
             payload.reserve(1 + words.size());
             payload.push_back(rec.size());
@@ -742,9 +672,9 @@ int main(int argc, char** argv)
         vector<uint8_t> req(req_s.begin(), req_s.end());
         log("HTTP request: " + std::to_string(req.size()) + " bytes");
 
-        send_public_inputs_raw64(client, digest_to_words32(th_sf));
+        send_public_inputs_raw64(client, otls_wire::digest_to_words32(th_sf));
         {
-            auto req_words = pack_bytes(req, MAX_APP_WORDS);
+            auto req_words = otls_wire::pack_bytes(req, MAX_APP_WORDS);
             vector<long> payload;
             payload.reserve(1 + req_words.size());
             payload.push_back(req.size());
@@ -777,10 +707,13 @@ int main(int argc, char** argv)
             fin_rec = unpack_words(fin_packed, fin_len);
             app_rec = unpack_words(app_packed, app_len);
         }
+        log("Sending Client Finished: " + std::to_string(fin_rec.size())
+                + " B, application record: " + std::to_string(app_rec.size()) + " B");
         send_all(sock, fin_rec.data(), fin_rec.size());
         send_all(sock, app_rec.data(), app_rec.size());
 
         vector<vector<uint8_t>> all_resp;
+        int post_hs_records_ok = 0;
         for (int i = 0; i < MAX_RESP_RECORDS + 4; ++i)
         {
             if (!wait_readable(sock, 2.0))
@@ -788,6 +721,7 @@ int main(int argc, char** argv)
             try
             {
                 auto rec = read_tls_record(sock);
+                post_hs_records_ok++;
                 vector<uint8_t> whole = rec.header;
                 whole.insert(whole.end(), rec.payload.begin(), rec.payload.end());
                 log("  post-HS record ct=" + std::to_string(rec.type) + " len=" + std::to_string(whole.size()));
@@ -796,7 +730,10 @@ int main(int argc, char** argv)
             }
             catch (std::exception& e)
             {
-                log(string("  read error: ") + e.what());
+                log(string("  read error (failed while reading TLS record #") + std::to_string(post_hs_records_ok + 1)
+                        + " after " + std::to_string(post_hs_records_ok) + " complete record(s), "
+                        + std::to_string((int) all_resp.size()) + " application record(s) stored): "
+                        + e.what());
                 break;
             }
         }
@@ -819,7 +756,7 @@ int main(int argc, char** argv)
             payload.reserve(1 + MAX_APP_WORDS);
             if (i < (int) resp_records.size())
             {
-                auto w = pack_bytes(resp_records[i], MAX_APP_WORDS);
+                auto w = otls_wire::pack_bytes(resp_records[i], MAX_APP_WORDS);
                 payload.push_back(resp_records[i].size());
                 payload.insert(payload.end(), w.begin(), w.end());
             }

@@ -281,6 +281,12 @@
 
 #define REMAINING_INSTRUCTIONS \
     X(OTLS_CONN_ROLE, throw not_implemented(),) \
+    X(OTLS_TCP_CONNECT, throw not_implemented(),) \
+    X(OTLS_TCP_CLOSE, throw not_implemented(),) \
+    X(OTLS_TCP_BCAST_SEND, throw not_implemented(),) \
+    X(OTLS_TCP_BCAST_RECV, throw not_implemented(),) \
+    X(OTLS_TLS_CLIENTHELLO_POC, throw not_implemented(),) \
+    X(OTLS_TCP_BCAST_RECV_TLS_RECORD, throw not_implemented(),) \
     X(CONVMODP, throw not_implemented(),) \
     X(LDMC, throw not_implemented(),) \
     X(STMC, throw not_implemented(),) \

@@ -1,5 +1,6 @@
 # Minimal entry: in-process OTLS hook (C++ sees party id + role).
-# Full TLS still uses ExternalIO client binary until TCP is moved into party VM.
+# For TCP inside the VM see Programs/Source/otls_tcp_poc.mpc + Scripts/otls-run-tcp-poc.sh.
+# Full TLS+MPC (otls_demo_field) may still use ExternalIO until migrated.
 from Compiler.library import print_ln, get_player_id, otls_connection_role
 
 print_ln('otls_hello: start')

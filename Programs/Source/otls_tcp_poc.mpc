@@ -1,0 +1,18 @@
+# In-VM TCP on party 1: connect to OTLS_HOST:443, send TLS ClientHello (C++), recv 5 B record header (broadcast).
+# No ExternalIO process. Set OTLS_HOST (default restcountries.com in C++).
+from Compiler.library import print_ln, get_player_id
+from Compiler.library import (
+    otls_tcp_connect,
+    otls_tcp_close,
+    otls_tls_clienthello_poc,
+    otls_tcp_bcast_recv,
+)
+from Compiler.types import regint
+
+print_ln('otls_tcp_poc: player %s', get_player_id())
+otls_tcp_connect(443)
+otls_tls_clienthello_poc()
+hdr = regint(size=1)
+otls_tcp_bcast_recv(hdr, 5)
+otls_tcp_close()
+print_ln('otls_tcp_poc: done (first LE word of TLS header bytes=%s)', hdr[0])

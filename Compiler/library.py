@@ -1886,6 +1886,61 @@ def otls_connection_role(role):
     """
     instructions.otls_conn_role(role)
 
+def otls_tcp_connect(port):
+    """ TCP connect to ``getenv('OTLS_HOST') or 'restcountries.com'`` at ``port`` (party 1 only; others no-op). """
+    instructions.otls_tcp_connect(port)
+
+def otls_tcp_close():
+    """ Close in-VM OTLS TCP fd (party 1 only). """
+    instructions.otls_tcp_close()
+
+def otls_tls_clienthello_poc():
+    """ After :py:func:`otls_tcp_connect`, party 1 sends a TLS 1.3 ClientHello (X25519); SNI from ``OTLS_HOST`` (default restcountries.com). """
+    instructions.otls_tls_clienthello_poc()
+
+def otls_tcp_bcast_send(src, nbytes):
+    """ Send ``nbytes`` from little-endian clear word array ``src`` over TCP (party 1 only). All parties must run with identical ``src`` (replicated clear values). """
+    nw = (int(nbytes) + 7) // 8
+    if len(src) != nw:
+        raise CompilerError('otls_tcp_bcast_send: len(src) must be (nbytes+7)//8')
+    instructions.otls_tcp_bcast_send(src, nbytes)
+
+def otls_tcp_bcast_recv(dest, nbytes):
+    """ Receive ``nbytes`` from TCP on party 1, broadcast to all; write LE words into ``dest``. """
+    nw = (int(nbytes) + 7) // 8
+    if len(dest) != nw:
+        raise CompilerError('otls_tcp_bcast_recv: len(dest) must be (nbytes+7)//8')
+    instructions.otls_tcp_bcast_recv(dest, nbytes)
+
+def otls_tcp_bcast_recv_tls_record(dest, max_record_bytes):
+    """ Receive one full TLS record on party 1, broadcast to all.
+
+    Writes ``dest[0] = actual_len`` and ``dest[1:]`` as 64-bit BE-packed words
+    exactly like ``pack_bytes(record_bytes, ...)`` in the ExternalIO client.
+    ``max_record_bytes`` must match ``len(dest)-1`` by ``(max+7)//8``.
+    """
+    nw = (int(max_record_bytes) + 7) // 8
+    if len(dest) != 1 + nw:
+        raise CompilerError('otls_tcp_bcast_recv_tls_record: len(dest) must be 1 + (max_record_bytes+7)//8')
+    instructions.otls_tcp_bcast_recv_tls_record(dest, max_record_bytes)
+
+def otls_regint_bytes_le(s):
+    """ Pack a constant Python str/bytes into a ``regint`` vector (LE 64-bit words) for :py:func:`otls_tcp_bcast_send`. """
+    from Compiler.types import regint
+    if isinstance(s, str):
+        s = s.encode()
+    n = len(s)
+    nw = (n + 7) // 8
+    words = []
+    for i in range(nw):
+        w = 0
+        for j in range(8):
+            idx = i * 8 + j
+            if idx < n:
+                w |= s[idx] << (8 * j)
+        words.append(w)
+    return regint(words)
+
 def listen_for_clients(port):
     """ Listen for clients on specific port base.
 

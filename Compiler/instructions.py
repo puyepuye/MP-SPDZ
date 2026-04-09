@@ -615,6 +615,39 @@ class otls_conn_role(base.Instruction):
     code = base.opcodes['OTLS_CONN_ROLE']
     arg_format = ['i']
 
+class otls_tcp_connect(base.Instruction):
+    """ TCP connect to ``OTLS_HOST``:port (party 1 only). """
+    code = base.opcodes['OTLS_TCP_CONNECT']
+    arg_format = ['i']
+
+class otls_tcp_close(base.Instruction):
+    """ Close OTLS TCP (party 1 only). """
+    code = base.opcodes['OTLS_TCP_CLOSE']
+    arg_format = []
+
+class otls_tcp_bcast_send(base.VectorInstruction):
+    """ Send clear LE words to TCP (party 1); all parties must execute with same data. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TCP_BCAST_SEND']
+    arg_format = ['ci', 'i']
+
+class otls_tcp_bcast_recv(base.VectorInstruction):
+    """ Recv from TCP on party 1 and broadcast; all parties get same LE words. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TCP_BCAST_RECV']
+    arg_format = ['ciw', 'i']
+
+class otls_tls_clienthello_poc(base.Instruction):
+    """ Party 1 sends TLS 1.3 ClientHello on existing TCP (SNI from ``OTLS_HOST``). """
+    code = base.opcodes['OTLS_TLS_CLIENTHELLO_POC']
+    arg_format = []
+
+class otls_tcp_bcast_recv_tls_record(base.VectorInstruction):
+    """ Party 1 recv TLS record header+payload, broadcast to all, write ``[len, packed_words...]``. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TCP_BCAST_RECV_TLS_RECORD']
+    arg_format = ['ciw', 'i']
+
 ###
 ### Basic arithmetic
 ###
