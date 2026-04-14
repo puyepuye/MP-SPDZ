@@ -285,7 +285,10 @@ otls_tcp_send_record_be(fin_send, APP_BUF_BYTES)
 print_ln('otls(field-vm): Client Finished sent (%s B)', fin_rec_len)
 
 # --- 10. Build + send application record (HTTP GET) ---------------------------
-req_str = b'GET /v3.1/name/peru HTTP/1.1\r\nHost: restcountries.com\r\nConnection: close\r\n\r\n'
+import os as _os
+_otls_host = _os.environ.get('OTLS_HOST', 'restcountries.com')
+_otls_path = _os.environ.get('OTLS_PATH', '/v3.1/name/canada')
+req_str = f'GET {_otls_path} HTTP/1.1\r\nHost: {_otls_host}\r\nConnection: close\r\n\r\n'.encode()
 req_bv = regint_words_to_bv(otls_regint_bytes_be(req_str, REQ_MAX_BYTES), REQ_MAX_BYTES)
 app_rec, app_rec_len = build_tls_record(ck, ci, 0, req_bv, REQ_MAX_BYTES, 0x17)
 
