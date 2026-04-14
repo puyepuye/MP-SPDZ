@@ -87,6 +87,126 @@ and all the arithmetic happens in the Curve25519 field.
 |------|-------------|
 | `otls.conf` | Stores the prime, host, and path. Sourced by the run script. |
 
+## Architecture diagrams
+
+### File interactions (compile time vs runtime)
+
+```mermaid
+graph TD
+    subgraph "Compile Time (Python)"
+        CONF[otls.conf<br/>OTLS_HOST, OTLS_PATH, OTLS_PRIME]
+        SCRIPT[otls-run-field-vm.sh<br/>sources config, runs compile + run]
+        MPC[otls_demo_field_vm.mpc<br/>MPC program source]
+        LIB[Compiler/library.py<br/>otls_tcp_connect etc wrappers]
+        INST[Compiler/instructions.py<br/>opcode numbers + arg formats]
+        INSTBASE[Compiler/instructions_base.py<br/>OTLS_ opcode hex values]
+        BC[Programs/Bytecode/*.bc<br/>compiled bytecode]
+
+        SCRIPT -->|sets env vars| MPC
+        CONF -->|sourced by| SCRIPT
+        MPC -->|imports from| LIB
+        LIB -->|emits| INST
+        INST -->|reads opcodes from| INSTBASE
+        MPC -->|compile.py produces| BC
+    end
+
+    subgraph "Runtime (C++)"
+        VM[replicated-field-party.x<br/>MP-SPDZ VM binary]
+        DISPATCH[Processor/Instruction.hpp<br/>opcode dispatch switch]
+        OTLS_CPP[Processor/OtlsConnection.cpp<br/>TCP, TLS records, SHA-256]
+        SERVER[HTTPS Server<br/>e.g. restcountries.com]
+
+        BC -->|loaded by| VM
+        VM -->|executes via| DISPATCH
+        DISPATCH -->|OTLS_ cases call| OTLS_CPP
+        OTLS_CPP -->|TCP socket| SERVER
+    end
+
+    subgraph "Post-processing (Python)"
+        DECODER[Scripts/otls-decode-response.py<br/>integer words to ASCII]
+        VM -->|stdout piped to| DECODER
+    end
+```
+
+### Runtime sequence (TLS 1.3 handshake + HTTP fetch)
+
+```mermaid
+sequenceDiagram
+    participant P0 as Party 0
+    participant P1 as Party 1 (TCP owner)
+    participant P2 as Party 2
+    participant S as HTTPS Server
+
+    Note over P0,P2: All 3 parties run the same bytecode in sync
+
+    rect rgb(230, 245, 255)
+    Note right of P1: 1. TCP + ClientHello (C++ opcodes)
+    P1->>S: TCP connect
+    P1->>S: TLS ClientHello (X25519)
+    S->>P1: ServerHello + server pubkey
+    P1->>P0: broadcast ServerHello data
+    P1->>P2: broadcast ServerHello data
+    end
+
+    rect rgb(255, 245, 230)
+    Note right of P1: 2. Export meta (C++ opcode)
+    Note over P0,P2: All parties get: transcript_hash(CH||SH) + server_pub
+    end
+
+    rect rgb(230, 255, 230)
+    Note right of P1: 3. Scalar shares (party 1 input file)
+    P1-->>P0: sint.input_from(1): secret-shared scalar
+    P1-->>P2: sint.input_from(1): secret-shared scalar
+    Note over P0,P2: Reconstruct k = k0 + k1 + k2 (mod 2^256) in MPC
+    end
+
+    rect rgb(255, 230, 255)
+    Note right of P1: 4. X25519 ECDH (MPC, 255 ladder steps)
+    Note over P0,P2: shared_secret = k * server_pub (never revealed)
+    end
+
+    rect rgb(230, 245, 255)
+    Note right of P1: 5. Fetch encrypted HS records (C++ opcode)
+    S->>P1: encrypted handshake records
+    P1->>P0: broadcast records
+    P1->>P2: broadcast records
+    end
+
+    rect rgb(255, 230, 230)
+    Note right of P1: 6. Derive keys + decrypt (MPC binary circuits)
+    Note over P0,P2: HKDF-SHA256 key derivation in MPC
+    Note over P0,P2: AES-128-GCM decrypt each HS record in MPC
+    Note over P0,P2: Feed plaintext into transcript hash (C++ opcode)
+    end
+
+    rect rgb(230, 255, 245)
+    Note right of P1: 7. Finalize + send Client Finished (MPC + C++ opcode)
+    Note over P0,P2: Compute Client Finished MAC in MPC
+    Note over P0,P2: Encrypt with AES-GCM in MPC, reveal ciphertext
+    P1->>S: Client Finished (encrypted)
+    end
+
+    rect rgb(245, 245, 230)
+    Note right of P1: 8. Send HTTP request (MPC + C++ opcode)
+    Note over P0,P2: Encrypt GET request with app keys in MPC
+    P1->>S: Application Data (encrypted HTTP GET)
+    end
+
+    rect rgb(230, 240, 255)
+    Note right of P1: 9. Receive + decrypt response (C++ opcode + MPC)
+    S->>P1: Application Data (encrypted HTTP response)
+    P1->>P0: broadcast response records
+    P1->>P2: broadcast response records
+    Note over P0,P2: AES-GCM decrypt response in MPC
+    Note over P0,P2: Reveal plaintext, print as integer words
+    end
+
+    rect rgb(240, 240, 240)
+    Note right of P1: 10. Decode (post-processing Python script)
+    Note over P0,P2: otls-decode-response.py converts words to ASCII
+    end
+```
+
 ## How the pipeline works
 
 1. Party 1 opens a TCP connection to the target HTTPS server.
