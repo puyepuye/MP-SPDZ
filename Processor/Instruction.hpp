@@ -288,10 +288,16 @@ void BaseInstruction::parse_operands(istream& s, int pos, int file_pos)
         break;
       case OTLS_TCP_CLOSE:
       case OTLS_TLS_CLIENTHELLO_POC:
+      case OTLS_TLS_WRITE_SCALAR_INPUT_POC:
         break;
       case OTLS_TCP_BCAST_SEND:
       case OTLS_TCP_BCAST_RECV:
       case OTLS_TCP_BCAST_RECV_TLS_RECORD:
+      case OTLS_TLS_EXPORT_META_POC:
+      case OTLS_TCP_SEND_RECORD_BE:
+      case OTLS_TCP_BCAST_WAIT_READABLE:
+      case OTLS_TLS_FEED_HS_PLAIN_POC:
+      case OTLS_TLS_FINALIZE_TH_SF_POC:
         r[0] = get_int(s);
         n = get_int(s);
         break;
@@ -591,6 +597,8 @@ int BaseInstruction::get_reg_type() const
     case MOVINT:
     case READSOCKETINT:
     case OTLS_TCP_BCAST_SEND:
+    case OTLS_TCP_SEND_RECORD_BE:
+    case OTLS_TLS_FEED_HS_PLAIN_POC:
     case WRITESOCKETINT:
     case INITCLIENTCONNECTION:
     case INITSECURESOCKET:
@@ -614,6 +622,9 @@ int BaseInstruction::get_reg_type() const
     case CALL_TAPE:
     case OTLS_TCP_BCAST_RECV:
     case OTLS_TCP_BCAST_RECV_TLS_RECORD:
+    case OTLS_TLS_EXPORT_META_POC:
+    case OTLS_TCP_BCAST_WAIT_READABLE:
+    case OTLS_TLS_FINALIZE_TH_SF_POC:
       return INT;
     case PREP:
     case GPREP:
@@ -627,6 +638,7 @@ int BaseInstruction::get_reg_type() const
     case OTLS_CONN_ROLE:
     case OTLS_TCP_CONNECT:
     case OTLS_TCP_CLOSE:
+    case OTLS_TLS_WRITE_SCALAR_INPUT_POC:
       return NONE;
     case LDI:
     case LDMC:
@@ -1354,13 +1366,31 @@ inline void Instruction::execute(Processor<sint, sgf2n>& Proc) const
         break;
       case OTLS_TCP_BCAST_SEND:
         OtlsConnection::tcp_bcast_send(Proc, Proc.P.my_num(), n, r[0], size);
-        break;
+        return;
       case OTLS_TCP_BCAST_RECV:
         OtlsConnection::tcp_bcast_recv(Proc, Proc.P, Proc.P.my_num(), n, r[0], size);
-        break;
+        return;
       case OTLS_TCP_BCAST_RECV_TLS_RECORD:
         OtlsConnection::tcp_bcast_recv_tls_record(Proc, Proc.P, Proc.P.my_num(), n, r[0], size);
-        break;
+        return;
+      case OTLS_TLS_EXPORT_META_POC:
+        OtlsConnection::tls_export_meta_words_poc(Proc, Proc.P, Proc.P.my_num(), r[0], size);
+        return;
+      case OTLS_TLS_WRITE_SCALAR_INPUT_POC:
+        OtlsConnection::tls_write_scalar_input_poc(Proc, Proc.P.my_num());
+        return;
+      case OTLS_TCP_SEND_RECORD_BE:
+        OtlsConnection::tcp_send_record_be(Proc, Proc.P.my_num(), n, r[0], size);
+        return;
+      case OTLS_TCP_BCAST_WAIT_READABLE:
+        OtlsConnection::tcp_bcast_wait_readable(Proc, Proc.P, Proc.P.my_num(), n, r[0]);
+        return;
+      case OTLS_TLS_FEED_HS_PLAIN_POC:
+        OtlsConnection::tls_feed_hs_plain_poc(Proc, Proc.P, Proc.P.my_num(), n, r[0], size);
+        return;
+      case OTLS_TLS_FINALIZE_TH_SF_POC:
+        OtlsConnection::tls_finalize_th_sf_poc(Proc, Proc.P, Proc.P.my_num(), r[0], size);
+        return;
       case CMDLINEARG:
         {
           size_t idx = Proc.read_Ci(r[1]);

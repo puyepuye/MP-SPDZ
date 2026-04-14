@@ -88,7 +88,7 @@ offline: $(OT_EXE) Check-Offline.x mascot-offline.x cowgear-offline.x lowgear-of
 
 gen_input: gen_input_f2n.x gen_input_fp.x
 
-externalIO: bankers-bonus-client.x otls-external-io-client.x
+externalIO: bankers-bonus-client.x otls-external-io-client.x otls-wire-format-test.x
 
 bmr: bmr-program-party.x bmr-program-tparty.x
 
@@ -200,8 +200,11 @@ bmr-clean:
 bankers-bonus-client.x: ExternalIO/bankers-bonus-client.o $(COMMON)
 	$(CXX) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-otls-external-io-client.x: ExternalIO/otls_external_io_client.o $(COMMON)
+otls-external-io-client.x: ExternalIO/otls_external_io_client.o ExternalIO/otls_wire_format.o $(COMMON)
 	$(CXX) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+otls-wire-format-test.x: ExternalIO/otls_wire_format_test.o ExternalIO/otls_wire_format.o
+	$(CXX) $(CFLAGS) -o $@ $^ $(BREW_LDLIBS) -lcrypto
 
 simple-offline.x: $(FHEOFFLINE)
 pairwise-offline.x: $(FHEOFFLINE)

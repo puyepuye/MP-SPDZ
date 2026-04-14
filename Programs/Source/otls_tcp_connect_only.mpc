@@ -1,7 +1,0 @@
-# Minimal: only connect + close (no send/recv).
-from Compiler.library import print_ln, get_player_id, otls_tcp_connect, otls_tcp_close
-
-print_ln('player %s', get_player_id())
-otls_tcp_connect(80)
-otls_tcp_close()
-print_ln('ok')

@@ -287,6 +287,8 @@
     X(OTLS_TCP_BCAST_RECV, throw not_implemented(),) \
     X(OTLS_TLS_CLIENTHELLO_POC, throw not_implemented(),) \
     X(OTLS_TCP_BCAST_RECV_TLS_RECORD, throw not_implemented(),) \
+    X(OTLS_TLS_EXPORT_META_POC, throw not_implemented(),) \
+    X(OTLS_TLS_WRITE_SCALAR_INPUT_POC, throw not_implemented(),) \
     X(CONVMODP, throw not_implemented(),) \
     X(LDMC, throw not_implemented(),) \
     X(STMC, throw not_implemented(),) \

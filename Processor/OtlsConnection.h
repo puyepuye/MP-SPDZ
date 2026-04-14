@@ -34,6 +34,37 @@ void send_tls_client_hello_poc(int my_party);
  *  ``Ci[r_base] = actual_len`` plus BE-packed 64-bit words at ``Ci[r_base+1..]``. */
 void tcp_bcast_recv_tls_record(ArithmeticProcessor& Proc, Player& P, int my_party,
         int max_record_bytes, int r_base, int n_words);
+
+/** Party 1 reads ServerHello, computes th(CH||SH), extracts server X25519 pubkey, and
+ *  writes 8 words: th words (4) + server_pub words (4). */
+void tls_export_meta_words_poc(ArithmeticProcessor& Proc, Player& P, int my_party, int r_base,
+        int n_words);
+
+/** Party 1 writes 12 scalar-share words into Input-P1-<thread> for secure
+ *  ``sint.Array(...).input_from(1)`` in VM-only mode. */
+void tls_write_scalar_input_poc(ArithmeticProcessor& Proc, int my_party);
+
+/** Party 1 unpacks BE-packed clear words from ``Ci[r_base+1..]`` to ``Ci[r_base]``
+ *  bytes and sends them on the TCP socket. Other parties no-op but must execute. */
+void tcp_send_record_be(ArithmeticProcessor& Proc, int my_party, int max_bytes,
+        int r_base, int n_words);
+
+/** Party 1 polls ``select()`` on the TCP fd with ``timeout_ms`` and broadcasts the
+ *  result (1=readable, 0=timeout) to all parties via ``Ci[r_base]``. */
+void tcp_bcast_wait_readable(ArithmeticProcessor& Proc, Player& P, int my_party,
+        int timeout_ms, int r_base);
+
+/** Feed one decrypted HS plaintext record into the running SHA-256 transcript.
+ *  On first call, seeds with stored CH + SH messages. Records with inner_ct == 0x16
+ *  contribute to the hash; others increment the NST counter. ``src`` is ``[actual_len,
+ *  BE_words...]``. All parties must call; party 1 drives, broadcasts inner_ct. */
+void tls_feed_hs_plain_poc(ArithmeticProcessor& Proc, Player& P, int my_party,
+        int max_bytes, int r_base, int n_words);
+
+/** Finalize th_sf = SHA-256(CH || SH || HS messages) and output 5 words:
+ *  ``dest[0:4]`` = th_sf (BE 64-bit words), ``dest[4]`` = n_nst_phase0. */
+void tls_finalize_th_sf_poc(ArithmeticProcessor& Proc, Player& P, int my_party,
+        int r_base, int n_words);
 } // namespace OtlsConnection
 
 #endif

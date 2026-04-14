@@ -1,0 +1,356 @@
+"""
+OTLS field VM: full TLS 1.3 handshake + HTTP fetch, no ExternalIO client.
+
+Party 1 owns the TCP/TLS socket. All data is broadcast to other parties via
+MP-SPDZ channels so every party sees identical clear values.
+
+Flow:
+  1. TCP connect + TLS ClientHello (VM opcode)
+  2. Secure scalar handoff (party-1 input file)
+  3. Meta export: th(CH||SH) + server_pub
+  4. X25519 ECDH in MPC (Montgomery ladder)
+  5. Fetch encrypted HS records
+  6. Derive HS keys (HKDF)
+  7. Decrypt HS records, feed into clear SHA-256 transcript
+  8. Finalize th_sf, derive app keys
+  9. Build + send Client Finished record
+ 10. Build + send application record (HTTP GET)
+ 11. Fetch response records (wait_readable loop)
+ 12. Compute srv_app_seq, decrypt first response, print body
+"""
+
+from Compiler.GC.types import sbitint
+
+_oc_ns = dict(globals())
+exec(compile(open('Programs/Source/otls_crypto.mpc').read(),
+             'Programs/Source/otls_crypto.mpc', 'exec'), _oc_ns)
+
+_CRYPTO_EXPORTS = (
+    'bv_xor', 'bv_cat', 'bv_zeros', 'bv_hex', 'bv_slice', 'bv_reverse', 'sha256',
+    'hmac_sha256', 'hkdf_extract', 'hkdf_expand', 'hkdf_expand_label', 'derive_secret',
+    'aes128_encrypt_block', 'aes128_gcm_encrypt', 'empty_hash', 'tls_nonce', 'tls_nonce_r',
+    'gcm_ctr', 'derive_hs_keys_from_th_hash', 'derive_app_keys_from_th_hash', 'build_tls_record',
+)
+for _n in _CRYPTO_EXPORTS:
+    globals()[_n] = _oc_ns[_n]
+
+derive_hs_keys = derive_hs_keys_from_th_hash
+derive_app_keys = derive_app_keys_from_th_hash
+
+program.options.preserve_mem_order = True
+
+P25519 = (1 << 255) - 19
+A24 = 121665
+
+REC_BUF_BYTES = 2560
+REC_BUF_WORDS = 320
+APP_BUF_BYTES = 4096
+APP_BUF_WORDS = 512
+MAX_HS_RECORDS = 5
+MAX_RESP_RECORDS = 2
+MAX_RESP_POLL = MAX_RESP_RECORDS + 4
+HS_CT_BYTES = REC_BUF_BYTES - 21
+RESP_CT_BYTES = APP_BUF_BYTES - 21
+REQ_MAX_BYTES = 256
+
+from Compiler.library import (
+    get_player_id,
+    otls_tcp_connect,
+    otls_tcp_close,
+    otls_tls_clienthello_poc,
+    otls_tls_export_meta_poc,
+    otls_tls_write_scalar_input_poc,
+    otls_tcp_bcast_recv_tls_record,
+    otls_tcp_send_record_be,
+    otls_tcp_bcast_wait_readable,
+    otls_tls_feed_hs_plain_poc,
+    otls_tls_finalize_th_sf_poc,
+    otls_regint_bytes_be,
+    print_ln,
+)
+from Compiler.types import regint, sint, Array, MemValue
+
+# --- Scalar / crypto helpers (same as otls_demo_field.mpc) -----------------------
+
+def sint_words_be_to_bits_le(words4):
+    sb64 = sbitint.get_type(64)
+    bits_le = []
+    for w in range(4):
+        chunk_bits_le = sb64(words4[w]).bit_decompose()
+        for b in range(8):
+            src = (7 - b) * 8
+            bits_le.extend(chunk_bits_le[src:src + 8])
+    return bits_le[:256]
+
+def _cswap_field(bit, a, b):
+    t = bit * (a - b)
+    return a - t, b + t
+
+def regint_words_to_u_sint(words4):
+    """Uses BITDECINT for byte extraction — regint ``&`` goes through cint (field mod p)
+    which silently corrupts masking results for negative regint values (unsigned > 2^63)."""
+    all_bits_le = []
+    for w in range(4):
+        word_bits = words4[w].bit_decompose(64)
+        for b in range(8):
+            src = (7 - b) * 8
+            all_bits_le.extend(word_bits[src:src + 8])
+    u = sint(0)
+    for i in range(255, -1, -1):
+        u = u * sint(2) + sint(all_bits_le[i])
+    return u
+
+def x25519_ladder_bits_scalar(k_bits_in, u_elem):
+    kb = [sint(k_bits_in[i]) for i in range(256)]
+    kb[0] = sint(0)
+    kb[1] = sint(0)
+    kb[2] = sint(0)
+    kb[255] = sint(0)
+    kb[254] = sint(1)
+    k_bits = kb[:255]
+    x1 = u_elem
+    x2 = sint(1); z2 = sint(0)
+    x3 = x1;      z3 = sint(1)
+    swap = sint(0)
+    for t in range(254, -1, -1):
+        b = k_bits[t]
+        swap = swap + b - sint(2) * swap * b
+        x2, x3 = _cswap_field(swap, x2, x3)
+        z2, z3 = _cswap_field(swap, z2, z3)
+        swap = b
+        A = x2 + z2; AA = A * A
+        B = x2 - z2; BB = B * B
+        E = AA - BB
+        C = x3 + z3; D = x3 - z3
+        DA = D * A; CB = C * B
+        ApB = DA + CB; x3 = ApB * ApB
+        DmC = DA - CB; z3 = x1 * (DmC * DmC)
+        x2 = AA * BB; z2 = E * (AA + sint(A24) * E)
+    x2, x3 = _cswap_field(swap, x2, x3)
+    z2, z3 = _cswap_field(swap, z2, z3)
+    e = P25519 - 2
+    inv = sint(1); base = z2
+    for i in range(e.bit_length() - 1, -1, -1):
+        inv = inv * inv
+        if (e >> i) & 1:
+            inv = inv * base
+    return x2 * inv
+
+def field_x25519_out_to_ss_bv(out):
+    v = (out < sint(0)).if_else(out + sint(P25519), out)
+    sb255 = sbitint.get_type(255)
+    bits_le = sb255(v).bit_decompose() + [sbit(0)]
+    bits = []
+    for byte_idx in range(32):
+        for i in range(7, -1, -1):
+            bits.append(bits_le[byte_idx * 8 + i])
+    return sbitvec.from_vec(bits)
+
+def _add256_mod(a_bits, b_bits):
+    sb257 = sbitint.get_type(257)
+    pad1 = [sbit(0)]
+    a = sb257.bit_compose(a_bits[:256] + pad1)
+    b = sb257.bit_compose(b_bits[:256] + pad1)
+    s = a + b
+    return s.bit_decompose()[:256]
+
+def add_three_scalar_shares_bits(b0, b1, b2):
+    ab = _add256_mod(b0, b1)
+    return _add256_mod(ab, b2)
+
+def regint_words_to_bv(words, n_bytes):
+    """Uses BITDECINT to avoid regint & cint corruption for negative regint values."""
+    bits = []
+    for w_idx in range(n_bytes // 8 + (1 if n_bytes % 8 else 0)):
+        word_bits = words[w_idx].bit_decompose(64)
+        for b_in_w in range(8):
+            byte_idx = w_idx * 8 + b_in_w
+            if byte_idx >= n_bytes:
+                break
+            base = (7 - b_in_w) * 8
+            for bit in range(8):
+                bits.append(sbit(word_bits[base + 7 - bit]))
+    return sbitvec.from_vec(bits[:n_bytes * 8])
+
+def bv_reveal_to_sint_words(bv, n_bytes, max_words):
+    result = Array(max_words, sint)
+    for w in range(max_words):
+        val = regint(0)
+        for b_in_w in range(8):
+            bi = w * 8 + b_in_w
+            if bi >= n_bytes:
+                break
+            byte_val = regint(0)
+            for bit in range(8):
+                idx = bi * 8 + bit
+                if idx < len(bv.v):
+                    byte_val = byte_val + regint(bv.v[idx].reveal()) * regint(1 << (7 - bit))
+            val = val + byte_val * regint(1 << ((7 - b_in_w) * 8))
+        result[w] = sint(val)
+    return result
+
+# =============================================================================
+#  Main program
+# =============================================================================
+
+print_ln('otls(field-vm): player %s', get_player_id())
+
+# --- 1. TCP connect + TLS ClientHello ----------------------------------------
+otls_tcp_connect(443)
+otls_tls_clienthello_poc()
+
+# --- 2. Secure scalar handoff ------------------------------------------------
+otls_tls_write_scalar_input_poc()
+scalar_inp = sint.Array(12)
+scalar_inp.input_from(1)
+print_ln('otls(field-vm): scalar shares loaded')
+
+
+# --- 3. Meta export: th(CH||SH) + server_pub ---------------------------------
+meta = regint(size=8)
+otls_tls_export_meta_poc(meta)
+th_ch_sh_w = [meta[i] for i in range(4)]
+server_pub_w = [meta[i] for i in range(4, 8)]
+th_bv = regint_words_to_bv(th_ch_sh_w, 32)
+print_ln('otls(field-vm): meta exported')
+
+
+# --- 4. X25519 ECDH in MPC ---------------------------------------------------
+share0 = [scalar_inp[i] for i in range(4)]
+share1 = [scalar_inp[i] for i in range(4, 8)]
+share2 = [scalar_inp[i] for i in range(8, 12)]
+bits0 = sint_words_be_to_bits_le(share0)
+bits1 = sint_words_be_to_bits_le(share1)
+bits2 = sint_words_be_to_bits_le(share2)
+k_bits = add_three_scalar_shares_bits(bits0, bits1, bits2)
+u = regint_words_to_u_sint(server_pub_w)
+out_x = x25519_ladder_bits_scalar(k_bits, u)
+ss_bv = field_x25519_out_to_ss_bv(out_x)
+print_ln('otls(field-vm): X25519 done')
+
+
+# --- 5. Fetch encrypted HS records (wait_readable before each) ----------------
+rec_data = [regint(size=1 + REC_BUF_WORDS) for _ in range(MAX_HS_RECORDS)]
+n_enc = MemValue(regint(0))
+for i in range(MAX_HS_RECORDS):
+    ready = regint()
+    otls_tcp_bcast_wait_readable(ready, 500)
+    @if_(ready)
+    def _():
+        otls_tcp_bcast_recv_tls_record(rec_data[i], REC_BUF_BYTES)
+        n_enc.write(n_enc.read() + 1)
+        print_ln('otls(field-vm): HS rec %s len=%s', i, rec_data[i][0])
+print_ln('otls(field-vm): fetched %s HS records', n_enc.read())
+
+# --- 6. Derive HS keys -------------------------------------------------------
+print_ln('otls(field-vm): deriving HS keys')
+hs_sec, s_key, s_iv, c_key, c_iv, fin_key = derive_hs_keys(ss_bv, th_bv)
+print_ln('otls(field-vm): HS keys done')
+
+# --- 7. Decrypt HS records + feed into clear transcript hash ------------------
+for ri in range(MAX_HS_RECORDS):
+    r = rec_data[ri]
+    r_bv = regint_words_to_bv(r[1:], REC_BUF_BYTES)
+    ct_bv = bv_slice(r_bv, 40, 40 + HS_CT_BYTES * 8)
+    nonce_i = tls_nonce(s_iv, ri)
+    plain_i = gcm_ctr(s_key, nonce_i, ct_bv, HS_CT_BYTES)
+    words_i = bv_reveal_to_sint_words(plain_i, HS_CT_BYTES, REC_BUF_WORDS)
+    has_data = r[0] > regint(21)
+    actual_ct = (r[0] - regint(21)) * has_data
+    plain_vals = [actual_ct] + [words_i[j].reveal() for j in range(REC_BUF_WORDS)]
+    plain_clear = regint(plain_vals)
+    otls_tls_feed_hs_plain_poc(plain_clear, REC_BUF_BYTES)
+    print_ln('otls(field-vm): HS decrypt+feed rec %s', ri)
+
+# --- 8. Finalize th_sf, derive app keys --------------------------------------
+th_sf_out = regint(size=5)
+otls_tls_finalize_th_sf_poc(th_sf_out)
+th_sf_w = [th_sf_out[i] for i in range(4)]
+n_nst_phase0 = th_sf_out[4]
+th_sf_bv = regint_words_to_bv(th_sf_w, 32)
+print_ln('otls(field-vm): th_sf done, n_nst_phase0=%s', n_nst_phase0)
+
+ck, ci, sk, si = derive_app_keys(hs_sec, th_sf_bv)
+print_ln('otls(field-vm): app keys done')
+
+# --- 9. Build + send Client Finished -----------------------------------------
+vd = hmac_sha256(fin_key, th_sf_bv)
+fin_msg = bv_cat(bv_hex('14000020'), vd)
+fin_rec, fin_rec_len = build_tls_record(c_key, c_iv, 0, fin_msg, 36, 0x16)
+
+fw = bv_reveal_to_sint_words(fin_rec, fin_rec_len, APP_BUF_WORDS)
+fin_vals = [regint(fin_rec_len)] + [fw[i].reveal() for i in range(APP_BUF_WORDS)]
+fin_send = regint(fin_vals)
+otls_tcp_send_record_be(fin_send, APP_BUF_BYTES)
+print_ln('otls(field-vm): Client Finished sent (%s B)', fin_rec_len)
+
+# --- 10. Build + send application record (HTTP GET) ---------------------------
+req_str = b'GET /v3.1/name/peru HTTP/1.1\r\nHost: restcountries.com\r\nConnection: close\r\n\r\n'
+req_bv = regint_words_to_bv(otls_regint_bytes_be(req_str, REQ_MAX_BYTES), REQ_MAX_BYTES)
+app_rec, app_rec_len = build_tls_record(ck, ci, 0, req_bv, REQ_MAX_BYTES, 0x17)
+
+aw = bv_reveal_to_sint_words(app_rec, app_rec_len, APP_BUF_WORDS)
+app_vals = [regint(app_rec_len)] + [aw[i].reveal() for i in range(APP_BUF_WORDS)]
+app_send = regint(app_vals)
+otls_tcp_send_record_be(app_send, APP_BUF_BYTES)
+print_ln('otls(field-vm): app record sent (%s B)', app_rec_len)
+
+# --- 11. Response fetch loop --------------------------------------------------
+resp_bufs = [regint(size=1 + APP_BUF_WORDS) for _ in range(MAX_RESP_POLL)]
+resp_fetched = MemValue(regint(0))
+for i in range(MAX_RESP_POLL):
+    ready = regint()
+    otls_tcp_bcast_wait_readable(ready, 2000)
+    @if_(ready)
+    def _():
+        otls_tcp_bcast_recv_tls_record(resp_bufs[i], APP_BUF_BYTES)
+        resp_fetched.write(resp_fetched.read() + 1)
+        print_ln('otls(field-vm): resp rec %s len=%s', i, resp_bufs[i][0])
+
+print_ln('otls(field-vm): fetched %s response records', resp_fetched.read())
+
+# --- 12. Compute srv_app_seq -------------------------------------------------
+nst_in_resp = MemValue(regint(0))
+first_real_idx = MemValue(regint(-1))
+fetched_val = resp_fetched.read()
+for i in range(MAX_RESP_POLL):
+    rec_len = resp_bufs[i][0]
+    is_fetched = regint(i) < fetched_val
+    is_small = rec_len < regint(300)
+    no_real_yet = first_real_idx.read() == regint(-1)
+    @if_(is_fetched * is_small * no_real_yet)
+    def _():
+        nst_in_resp.write(nst_in_resp.read() + 1)
+    @if_(is_fetched * (regint(1) - is_small) * no_real_yet)
+    def _():
+        first_real_idx.write(regint(i))
+
+srv_app_seq = n_nst_phase0 + nst_in_resp.read()
+print_ln('otls(field-vm): srv_app_seq=%s (phase0=%s resp=%s)', srv_app_seq, n_nst_phase0, nst_in_resp.read())
+
+# --- 13. Decrypt first response record ---------------------------------------
+# The first real response record is at index first_real_idx (runtime).
+# Since we can't dynamically index into a Python list at runtime,
+# decrypt each candidate and conditionally store it.
+# Each @if_ block is compile-time bounded (MAX_RESP_POLL iterations).
+
+real_idx = first_real_idx.read()
+resp_plain_words = Array(APP_BUF_WORDS, sint)
+for i in range(MAX_RESP_POLL):
+    @if_(regint(i) == real_idx)
+    def _():
+        rr_bv = regint_words_to_bv(resp_bufs[i][1:], APP_BUF_BYTES)
+        resp_ct = bv_slice(rr_bv, 40, 40 + RESP_CT_BYTES * 8)
+        resp_nonce = tls_nonce_r(si, srv_app_seq)
+        rp = gcm_ctr(sk, resp_nonce, resp_ct, RESP_CT_BYTES)
+        rw = bv_reveal_to_sint_words(rp, RESP_CT_BYTES, APP_BUF_WORDS)
+        for j in range(APP_BUF_WORDS):
+            resp_plain_words[j] = rw[j]
+
+print_ln('otls(field-vm): === RESPONSE BEGIN ===')
+for j in range(APP_BUF_WORDS):
+    print_ln('RESP_WORD %s %s', j, resp_plain_words[j].reveal())
+print_ln('otls(field-vm): === RESPONSE END ===')
+
+otls_tcp_close()
+print_ln('otls(field-vm): done')

@@ -172,7 +172,8 @@ void write_client_hello_record(int fd, const std::vector<uint8_t>& ch_msg)
 }
 } // namespace
 
-void otls_tls_send_client_hello_poc(int tcp_fd, const char* server_name)
+void otls_tls_send_client_hello_poc(int tcp_fd, const char* server_name,
+        std::vector<uint8_t>* out_ch_msg, std::array<uint8_t, 32>* out_priv)
 {
   if (tcp_fd < 0)
     throw std::runtime_error("OTLS TLS poc: invalid tcp fd");
@@ -183,4 +184,8 @@ void otls_tls_send_client_hello_poc(int tcp_fd, const char* server_name)
   auto kp = x25519_generate();
   auto ch = encode_client_hello(random, kp.pub, "http/1.1", sn);
   write_client_hello_record(tcp_fd, ch);
+  if (out_ch_msg)
+    *out_ch_msg = ch;
+  if (out_priv)
+    *out_priv = kp.priv;
 }

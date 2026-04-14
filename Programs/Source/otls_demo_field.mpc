@@ -95,14 +95,19 @@ def regint_words_to_u_sint(words4):
     """Decode server's X25519 public key u from 4 regint words (32-byte LE u-coordinate).
 
     This is the peer Montgomery point (u only); it is *public* on the wire.
+    Uses BITDECINT for byte extraction — regint ``&`` goes through cint (field mod p)
+    which silently corrupts masking results for negative regint values (unsigned > 2^63).
     """
-    v = sint(0)
-    for i in range(31, -1, -1):
-        w = i // 8
-        bi = i % 8
-        byte_r = (words4[w] >> regint(8 * (7 - bi))) & regint(0xFF)
-        v = v * sint(256) + sint(byte_r)
-    return v
+    all_bits_le = []
+    for w in range(4):
+        word_bits = words4[w].bit_decompose(64)
+        for b in range(8):
+            src = (7 - b) * 8
+            all_bits_le.extend(word_bits[src:src + 8])
+    u = sint(0)
+    for i in range(255, -1, -1):
+        u = u * sint(2) + sint(all_bits_le[i])
+    return u
 
 
 def x25519_ladder_bits_scalar(k_bits_in, u_elem):
@@ -212,16 +217,17 @@ def add_three_scalar_shares_bits(b0, b1, b2):
 
 
 def regint_words_to_bv(words, n_bytes):
+    """Uses BITDECINT to avoid regint & cint corruption for negative regint values."""
     bits = []
     for w_idx in range(n_bytes // 8 + (1 if n_bytes % 8 else 0)):
-        word = words[w_idx]
+        word_bits = words[w_idx].bit_decompose(64)
         for b_in_w in range(8):
             byte_idx = w_idx * 8 + b_in_w
             if byte_idx >= n_bytes:
                 break
-            byte_val = (word >> regint((7 - b_in_w) * 8)) & regint(0xFF)
+            base = (7 - b_in_w) * 8
             for bit in range(8):
-                bits.append(sbit((byte_val >> regint(7 - bit)) & regint(1)))
+                bits.append(sbit(word_bits[base + 7 - bit]))
     return sbitvec.from_vec(bits[:n_bytes * 8])
 
 
