@@ -8,14 +8,7 @@ three parties and never revealed.
 
 ## How to run
 
-Edit `otls.conf` to set the host and path you want to fetch:
-
-```
-OTLS_HOST=restcountries.com
-OTLS_PATH="/v3.1/name/peru"
-```
-
-Then run:
+Run with the default target (`https://restcountries.com/v3.1/name/peru`):
 
 ```bash
 cd MP-SPDZ
@@ -25,7 +18,8 @@ cd MP-SPDZ
 This compiles the MPC program (about 18 minutes), builds the C++ binary,
 runs 3 parties locally, and prints the decoded HTTP response.
 
-You can also override the config with environment variables:
+To point the prototype at a different HTTPS endpoint, set `OTLS_HOST` and
+`OTLS_PATH` in the environment:
 
 ```bash
 OTLS_HOST=restcountries.com OTLS_PATH="/v3.1/name/canada" ./Scripts/otls-run-field-vm.sh
@@ -40,16 +34,24 @@ OTLS_SKIP_BUILD=1 ./Scripts/otls-run-field-vm.sh
 
 ## Configuration
 
-All settings live in `otls.conf` at the root of the MP-SPDZ directory:
+All settings are read from the environment by
+`Scripts/otls-run-field-vm.sh`, with defaults inlined in the script:
 
-| Setting | What it is |
+| Variable | What it is |
 |---------|-----------|
-| `OTLS_PRIME` | The field prime (2^255 - 19). Do not change this. |
-| `OTLS_HOST` | The HTTPS host to connect to. |
-| `OTLS_PATH` | The HTTP request path (e.g. `/v3.1/name/peru`). |
+| `OTLS_HOST` | The HTTPS host to connect to. Defaults to `restcountries.com`. |
+| `OTLS_PATH` | The HTTP request path. Defaults to `/v3.1/name/peru`. |
+| `OTLS_SKIP_BUILD` | Set to `1` to skip the C++ rebuild (useful when only the MPC program changed). |
 
-The prime is 2^255 - 19 because the X25519 ECDH computation runs inside MPC
-and all the arithmetic happens in the Curve25519 field.
+The field prime is fixed at $2^{255} - 19$ because the X25519 ECDH
+computation runs inside MPC and all the arithmetic happens in the
+Curve25519 field. It is hard-coded in the run script and passed to
+`compile.py` via the `-P` flag.
+
+Note that `OTLS_HOST` and `OTLS_PATH` are baked into the bytecode by
+`compile.py`, so changing them requires rerunning the MPC compile (the
+run script does this automatically), but does not require rebuilding the
+C++ binary.
 
 ## Files
 
@@ -78,14 +80,8 @@ and all the arithmetic happens in the Curve25519 field.
 
 | File | What it does |
 |------|-------------|
-| `Scripts/otls-run-field-vm.sh` | Compile, build, and run. Sources `otls.conf` for settings. |
+| `Scripts/otls-run-field-vm.sh` | Compile, build, and run. Holds the default host, path, and field prime. |
 | `Scripts/otls-decode-response.py` | Decodes the integer output words into readable HTTP text. Called automatically by the run script. |
-
-### Config
-
-| File | What it does |
-|------|-------------|
-| `otls.conf` | Stores the prime, host, and path. Sourced by the run script. |
 
 ## Architecture diagrams
 
@@ -94,16 +90,16 @@ and all the arithmetic happens in the Curve25519 field.
 ```mermaid
 graph TD
     subgraph "Compile Time (Python)"
-        CONF[otls.conf<br/>OTLS_HOST, OTLS_PATH, OTLS_PRIME]
-        SCRIPT[otls-run-field-vm.sh<br/>sources config, runs compile + run]
+        SCRIPT[otls-run-field-vm.sh<br/>inlined defaults, runs compile + run]
+        ENV[Environment<br/>OTLS_HOST, OTLS_PATH overrides]
         MPC[otls_demo_field_vm.mpc<br/>MPC program source]
         LIB[Compiler/library.py<br/>otls_tcp_connect etc wrappers]
         INST[Compiler/instructions.py<br/>opcode numbers + arg formats]
         INSTBASE[Compiler/instructions_base.py<br/>OTLS_ opcode hex values]
         BC[Programs/Bytecode/*.bc<br/>compiled bytecode]
 
-        SCRIPT -->|sets env vars| MPC
-        CONF -->|sourced by| SCRIPT
+        ENV -->|optional override| SCRIPT
+        SCRIPT -->|exports env vars| MPC
         MPC -->|imports from| LIB
         LIB -->|emits| INST
         INST -->|reads opcodes from| INSTBASE
