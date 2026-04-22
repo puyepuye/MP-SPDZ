@@ -1878,6 +1878,143 @@ def get_player_id():
     playerid(res._v)
     return res
 
+def otls_connection_role(role):
+    """ In-process OTLS hook: C++ ``OtlsConnection::log_role(my_party, role)``.
+
+    Use with ``@if_(get_player_id() == k)`` when only one party should run TCP later.
+    Convention: ``role=0`` (hello / outbound control), ``role=1`` (socket owner), etc.
+    """
+    instructions.otls_conn_role(role)
+
+def otls_tcp_connect(port):
+    """ TCP connect to ``getenv('OTLS_HOST') or 'restcountries.com'`` at ``port`` (party 1 only; others no-op). """
+    instructions.otls_tcp_connect(port)
+
+def otls_tcp_close():
+    """ Close in-VM OTLS TCP fd (party 1 only). """
+    instructions.otls_tcp_close()
+
+def otls_tls_clienthello_poc():
+    """ After :py:func:`otls_tcp_connect`, party 1 sends a TLS 1.3 ClientHello (X25519); SNI from ``OTLS_HOST`` (default restcountries.com). """
+    instructions.otls_tls_clienthello_poc()
+
+def otls_tcp_bcast_send(src, nbytes):
+    """ Send ``nbytes`` from little-endian clear word array ``src`` over TCP (party 1 only). All parties must run with identical ``src`` (replicated clear values). """
+    nw = (int(nbytes) + 7) // 8
+    if len(src) != nw:
+        raise CompilerError('otls_tcp_bcast_send: len(src) must be (nbytes+7)//8')
+    instructions.otls_tcp_bcast_send(src, nbytes)
+
+def otls_tcp_bcast_recv(dest, nbytes):
+    """ Receive ``nbytes`` from TCP on party 1, broadcast to all; write LE words into ``dest``. """
+    nw = (int(nbytes) + 7) // 8
+    if len(dest) != nw:
+        raise CompilerError('otls_tcp_bcast_recv: len(dest) must be (nbytes+7)//8')
+    instructions.otls_tcp_bcast_recv(dest, nbytes)
+
+def otls_tcp_bcast_recv_tls_record(dest, max_record_bytes):
+    """ Receive one full TLS record on party 1, broadcast to all.
+
+    Writes ``dest[0] = actual_len`` and ``dest[1:]`` as 64-bit BE-packed words
+    exactly like ``pack_bytes(record_bytes, ...)`` in the ExternalIO client.
+    ``max_record_bytes`` must match ``len(dest)-1`` by ``(max+7)//8``.
+    """
+    nw = (int(max_record_bytes) + 7) // 8
+    if len(dest) != 1 + nw:
+        raise CompilerError('otls_tcp_bcast_recv_tls_record: len(dest) must be 1 + (max_record_bytes+7)//8')
+    instructions.otls_tcp_bcast_recv_tls_record(dest, max_record_bytes)
+
+def otls_tls_export_meta_poc(dest):
+    """ Export TLS meta after ClientHello: ``dest[0:4]=th(CH||SH)``, ``dest[4:8]=server_pub``.
+    ``dest`` must be a regint vector of length 8.
+    """
+    if len(dest) != 8:
+        raise CompilerError('otls_tls_export_meta_poc: len(dest) must be 8')
+    instructions.otls_tls_export_meta_poc(dest, 0)
+
+def otls_tls_write_scalar_input_poc():
+    """ Party 1 writes X25519 scalar shares to its ``Input-P1-*`` file for ``sint.input_from(1)``. """
+    instructions.otls_tls_write_scalar_input_poc()
+
+def otls_tcp_send_record_be(src, max_bytes):
+    """ Send ``src[0]`` bytes (unpacked from BE words in ``src[1:]``) on party-1 TCP.
+
+    ``src`` must be a regint vector of length ``1 + (max_bytes+7)//8``, matching
+    the shape of ``bv_reveal_to_sint_words`` output (len word + packed words).
+    """
+    nw = (int(max_bytes) + 7) // 8
+    if len(src) != 1 + nw:
+        raise CompilerError('otls_tcp_send_record_be: len(src) must be 1 + (max_bytes+7)//8')
+    instructions.otls_tcp_send_record_be(src, max_bytes)
+
+def otls_tcp_bcast_wait_readable(dest, timeout_ms):
+    """ Party 1 polls ``select()`` on the TCP fd with ``timeout_ms`` milliseconds.
+
+    Broadcasts result to all parties: ``dest`` gets 1 (readable) or 0 (timeout).
+    ``dest`` must be a single regint.
+    """
+    instructions.otls_tcp_bcast_wait_readable(dest, timeout_ms)
+
+def otls_tls_feed_hs_plain_poc(src, max_bytes):
+    """ Feed one decrypted HS plaintext record into the running SHA-256 transcript.
+
+    ``src`` must be a regint vector of length ``1 + (max_bytes+7)//8``:
+    ``src[0] = actual_len``, ``src[1:]`` = BE-packed words.
+    Records with inner_ct 0x16 update the hash; others increment n_nst.
+    """
+    nw = (int(max_bytes) + 7) // 8
+    if len(src) != 1 + nw:
+        raise CompilerError('otls_tls_feed_hs_plain_poc: len(src) must be 1 + (max_bytes+7)//8')
+    instructions.otls_tls_feed_hs_plain_poc(src, max_bytes)
+
+def otls_tls_finalize_th_sf_poc(dest):
+    """ Finalize transcript: ``dest[0:4]`` = th_sf (4 BE words), ``dest[4]`` = n_nst_phase0.
+
+    ``dest`` must be a regint vector of length 5.
+    """
+    if len(dest) != 5:
+        raise CompilerError('otls_tls_finalize_th_sf_poc: len(dest) must be 5')
+    instructions.otls_tls_finalize_th_sf_poc(dest, 0)
+
+def otls_regint_bytes_le(s):
+    """ Pack a constant Python str/bytes into a ``regint`` vector (LE 64-bit words) for :py:func:`otls_tcp_bcast_send`. """
+    from Compiler.types import regint
+    if isinstance(s, str):
+        s = s.encode()
+    n = len(s)
+    nw = (n + 7) // 8
+    words = []
+    for i in range(nw):
+        w = 0
+        for j in range(8):
+            idx = i * 8 + j
+            if idx < n:
+                w |= s[idx] << (8 * j)
+        words.append(w)
+    return regint(words)
+
+def otls_regint_bytes_be(s, max_bytes):
+    """ Pack a constant Python str/bytes into a ``regint`` vector (BE 64-bit words)
+    padded to ``max_bytes``, matching the ``regint_words_to_bv`` / ``pack_bytes`` format.
+
+    Returns a regint vector of length ``(max_bytes+7)//8``.
+    """
+    from Compiler.types import regint
+    if isinstance(s, str):
+        s = s.encode()
+    n = len(s)
+    nw = (max_bytes + 7) // 8
+    words = []
+    for i in range(nw):
+        w = 0
+        for j in range(8):
+            idx = i * 8 + j
+            w <<= 8
+            if idx < n:
+                w |= s[idx]
+        words.append(w)
+    return regint(words)
+
 def listen_for_clients(port):
     """ Listen for clients on specific port base.
 

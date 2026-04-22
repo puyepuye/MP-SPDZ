@@ -607,6 +607,81 @@ class playerid(base.Instruction):
     code = base.opcodes['PLAYERID']
     arg_format = ['ciw']
 
+class otls_conn_role(base.Instruction):
+    """ In-process OTLS hook: C++ receives party id and immediate role tag.
+
+    :param: role (int immediate; convention: 0 hello/sender side, 1 TCP/socket side, …)
+    """
+    code = base.opcodes['OTLS_CONN_ROLE']
+    arg_format = ['i']
+
+class otls_tcp_connect(base.Instruction):
+    """ TCP connect to ``OTLS_HOST``:port (party 1 only). """
+    code = base.opcodes['OTLS_TCP_CONNECT']
+    arg_format = ['i']
+
+class otls_tcp_close(base.Instruction):
+    """ Close OTLS TCP (party 1 only). """
+    code = base.opcodes['OTLS_TCP_CLOSE']
+    arg_format = []
+
+class otls_tcp_bcast_send(base.VectorInstruction):
+    """ Send clear LE words to TCP (party 1); all parties must execute with same data. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TCP_BCAST_SEND']
+    arg_format = ['ci', 'i']
+
+class otls_tcp_bcast_recv(base.VectorInstruction):
+    """ Recv from TCP on party 1 and broadcast; all parties get same LE words. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TCP_BCAST_RECV']
+    arg_format = ['ciw', 'i']
+
+class otls_tls_clienthello_poc(base.Instruction):
+    """ Party 1 sends TLS 1.3 ClientHello on existing TCP (SNI from ``OTLS_HOST``). """
+    code = base.opcodes['OTLS_TLS_CLIENTHELLO_POC']
+    arg_format = []
+
+class otls_tcp_bcast_recv_tls_record(base.VectorInstruction):
+    """ Party 1 recv TLS record header+payload, broadcast to all, write ``[len, packed_words...]``. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TCP_BCAST_RECV_TLS_RECORD']
+    arg_format = ['ciw', 'i']
+
+class otls_tls_export_meta_poc(base.VectorInstruction):
+    """ Export ``th(CH||SH)`` + ``server_pub`` as 8 clear words after ClientHello. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TLS_EXPORT_META_POC']
+    arg_format = ['ciw', 'i']
+
+class otls_tls_write_scalar_input_poc(base.Instruction):
+    """ Write party-1 scalar shares to Input-P1-* for secure ``sint.input_from(1)`` handoff. """
+    code = base.opcodes['OTLS_TLS_WRITE_SCALAR_INPUT_POC']
+    arg_format = []
+
+class otls_tcp_send_record_be(base.VectorInstruction):
+    """ Party 1 unpacks BE clear words to bytes and sends on TCP; ``src[0]=len``, ``src[1:]=words``. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TCP_SEND_RECORD_BE']
+    arg_format = ['ci', 'i']
+
+class otls_tcp_bcast_wait_readable(base.Instruction):
+    """ Party 1 polls TCP readable with timeout_ms; broadcasts 1/0 to all parties. """
+    code = base.opcodes['OTLS_TCP_BCAST_WAIT_READABLE']
+    arg_format = ['ciw', 'i']
+
+class otls_tls_feed_hs_plain_poc(base.VectorInstruction):
+    """ Feed decrypted HS plaintext ``[len, BE_words...]`` into running SHA-256 transcript. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TLS_FEED_HS_PLAIN_POC']
+    arg_format = ['ci', 'i']
+
+class otls_tls_finalize_th_sf_poc(base.VectorInstruction):
+    """ Finalize transcript hash: ``dest[0:4]=th_sf``, ``dest[4]=n_nst_phase0``. """
+    vector_index = 0
+    code = base.opcodes['OTLS_TLS_FINALIZE_TH_SF_POC']
+    arg_format = ['ciw', 'i']
+
 ###
 ### Basic arithmetic
 ###

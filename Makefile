@@ -200,6 +200,12 @@ bmr-clean:
 bankers-bonus-client.x: ExternalIO/bankers-bonus-client.o $(COMMON)
 	$(CXX) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+otls-external-io-client.x: ExternalIO/otls_external_io_client.o ExternalIO/otls_wire_format.o $(COMMON)
+	$(CXX) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+otls-wire-format-test.x: ExternalIO/otls_wire_format_test.o ExternalIO/otls_wire_format.o
+	$(CXX) $(CFLAGS) -o $@ $^ $(BREW_LDLIBS) -lcrypto
+
 simple-offline.x: $(FHEOFFLINE)
 pairwise-offline.x: $(FHEOFFLINE)
 cnc-offline.x: $(FHEOFFLINE)
